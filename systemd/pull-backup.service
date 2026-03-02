@@ -1,0 +1,29 @@
+[Unit]
+Description=Pull backups over WireGuard (rsync over SSH)
+Wants=network-online.target
+After=network-online.target local-fs.target
+RequiresMountsFor=/srv/storage
+
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+
+# Let systemd create persistent and runtime dirs:
+#StateDirectory=pull-backup/state
+StateDirectory=pull-backup
+RuntimeDirectory=pull-backup
+RuntimeDirectoryMode=0700
+
+ExecStart=/usr/local/sbin/pull-backup --daemon --jobs-file /etc/pull-backup/jobs.toml --state-dir /var/lib/pull-backup/state --lock-file /run/pull-backup/lock --auto
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+TimeoutStartSec=0
+TimeoutStopSec=5min
+KillMode=mixed
+

@@ -1,0 +1,24 @@
+[[job]]
+device = "mt"
+ssh = "mt"
+path = "/home/mt/"
+when = "Sun"
+description = "mt on kleinpanic over wg-backup"
+class = "servers"
+
+[[job]]
+device = "broklein"
+ssh = "broklein"
+path = "/home/broklein/"
+when = "Sun"
+description = "broklein laptop over wg-backup"
+class = "laptops"
+
+[[job]]
+device = "klein"
+ssh = "klein"
+path = "/home/klein/"
+when = "Sun"
+description = "kernelpanic laptop over wg-backup"
+class = "laptops"
+

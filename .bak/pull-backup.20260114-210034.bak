@@ -1,0 +1,2545 @@
+#!/usr/bin/env python3
+"""
+pull-backup: Pull backups over SSH (WireGuard), snapshot+retention.
+
+Preserved core behaviors:
+- Scheduler-driven: requires --daemon.
+- Preflight reachability = ssh works AND remote has rsync.
+- Resumable snapshots via snapshots/.inprogress-<device>/.run-tag
+- Dual logging:
+  - stdout (journald via systemd)
+  - per-job logfile under .../<class>/<device>/logs/
+- Retention: keep N snapshots per job (default 3).
+- Progress: periodic bytes-so-far + rate using du on the inprogress dir (no rsync --progress).
+- Stall watchdog: kill rsync only if "no progress" for --stall-timeout-s.
+
+Behavior improvements kept / expanded:
+- "quarantine" directory concept renamed to legacy/ (back-compat: action=quarantine accepted but writes into legacy/).
+- Off-days: resumables can run even if schedule doesn't match (controlled).
+- Better preflight ordering: resumables first, prior failures, then oldest successful backup (ledger), then oldest snapshot, etc.
+- Optional idle archiving: compress legacy snapshots into archives/<class>/<device>/<tag>.tar.zst using zstd -12.
+
+New in this version (per your requirements):
+A) Correctness:
+- Never finalize snapshots unless rsync reached terminal success (rc=0) or an explicitly finalized soft-success (23/24).
+- Retry exhaustion on transient rc -> FAILED attempts_exhausted(last_rc=...); leave .inprogress intact.
+
+B) Permission denied handling:
+- Classify "Permission denied (13)" read errors from rsync output and collect offending paths.
+- If rc=23/24 and ONLY permission-denied read errors occurred:
+  - re-run rsync once in the SAME run with runtime --exclude for each denied path (same tag/inprogress).
+  - aim to reach rc==0 while explicitly skipping unreadable files.
+- Persist auto-excludes in state dir: <device>.autoexclude (opt-in via --auto-ignore-perms; default ON).
+- Cap exclude growth via --auto-ignore-max.
+
+C) Stall reliability:
+- Stall requires BOTH no byte growth AND no rsync output activity for stall timeout.
+
+D) Configurable excludes:
+- jobs.toml supports:
+  - exclude = ["pattern", ...]           # rsync --exclude
+  - exclude_file = "/path/to/file"       # rsync --exclude-from
+  - stall_timeout_s / progress_interval_s / du_timeout_s (per-job overrides)
+
+E) Durable ledger:
+- JSONL ledger in state dir: runs.jsonl (one record per job completion; archive events too).
+
+F) Notifications (opt-in):
+- --notify uses notify-send if available + graphical session; logs NOTIFY_SKIP otherwise.
+
+I) Self-backup safety:
+- If job appears local (ssh=localhost/127.0.0.1/<hostname>), force-exclude backups root under the job path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import errno
+import fcntl
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Optional, Tuple
+
+
+# ----------------------------
+# FS error helpers
+# ----------------------------
+
+_FS_BAD_ERRNOS = {errno.ENODEV, errno.ESTALE, errno.EIO}
+
+
+def _is_bad_fs_error(e: BaseException) -> bool:
+    return isinstance(e, OSError) and getattr(e, "errno", None) in _FS_BAD_ERRNOS
+
+
+def _bad_fs(msg: str) -> RuntimeError:
+    return RuntimeError(msg)
+
+
+def safe_mkdir(path: Path, *, parents: bool = False) -> None:
+    try:
+        path.mkdir(parents=parents, exist_ok=True)
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            raise _bad_fs(
+                f"backup filesystem not available at {path} (stale mount / missing device)"
+            )
+        raise
+    except Exception as e:
+        try:
+            _ = os.stat(str(path))
+        except OSError as oe:
+            if _is_bad_fs_error(oe):
+                raise _bad_fs(
+                    f"backup filesystem not available at {path} (stale mount / missing device)"
+                )
+        raise e
+
+
+def statvfs_free_bytes(path: Path) -> int:
+    try:
+        st = os.statvfs(str(path))
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            raise _bad_fs(
+                f"backup filesystem not available at {path} (stale mount / missing device)"
+            )
+        raise
+    return st.f_frsize * st.f_bavail
+
+
+def assert_backups_root_ready(backups_root: Path) -> None:
+    try:
+        if not backups_root.exists():
+            raise RuntimeError(f"backups root does not exist: {backups_root}")
+        if not backups_root.is_dir():
+            raise RuntimeError(f"backups root is not a directory: {backups_root}")
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            raise _bad_fs(
+                f"backup filesystem not available at {backups_root} (stale mount / missing device)"
+            )
+        raise
+    _ = statvfs_free_bytes(backups_root)
+
+
+def safe_list_dirs(dirpath: Path) -> list[Path]:
+    try:
+        return [p for p in dirpath.iterdir() if p.is_dir()]
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            raise _bad_fs(
+                f"backup filesystem not available while listing {dirpath} ({e})"
+            )
+        raise
+
+
+def ensure_under(root: Path, p: Path) -> None:
+    root = root.resolve()
+    p = p.resolve(strict=False)
+    try:
+        p.relative_to(root)
+    except ValueError:
+        raise RuntimeError(f"path escapes root: {p} (root={root})")
+
+
+# ----------------------------
+# TOML loading
+# ----------------------------
+
+def load_toml(path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
+    try:
+        import tomllib  # py3.11+
+        return tomllib.loads(data.decode("utf-8"))
+    except Exception:
+        try:
+            import tomli  # type: ignore
+            return tomli.loads(data.decode("utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse TOML: {path} ({e})")
+
+
+# ----------------------------
+# Time helpers
+# ----------------------------
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def utc_tag() -> str:
+    return utc_now().strftime("%Y%m%d-%H%M%SZ")
+
+
+def iso_wd_and_name_local() -> Tuple[str, str]:
+    n = now_local()
+    return str(n.isoweekday()), n.strftime("%a")
+
+
+def parse_utc_tag(s: str) -> Optional[dt.datetime]:
+    """
+    Parse snapshot tag directory names of form YYYYmmdd-HHMMSSZ (UTC).
+    Returns UTC datetime or None.
+    """
+    try:
+        return dt.datetime.strptime(s, "%Y%m%d-%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Schedule matching
+# ----------------------------
+
+def when_matches_today(when: str) -> bool:
+    when = (when or "").strip().strip('"').strip("'")
+    if when == "" or when == "*" or when.lower() == "daily":
+        return True
+    iso, name = iso_wd_and_name_local()
+    parts = [p.strip() for p in when.split(",") if p.strip()]
+    for p in parts:
+        if p == iso or p.lower() == name.lower():
+            return True
+    return False
+
+
+# ----------------------------
+# State tracking (OFF backup mount)
+# ----------------------------
+
+def state_file(state_dir: Path, device: str) -> Path:
+    return state_dir / f"{device}.failure"
+
+
+def has_prior_failure(state_dir: Path, device: str) -> bool:
+    f = state_file(state_dir, device)
+    try:
+        return f.exists()
+    except OSError:
+        return False
+
+
+def mark_failure(state_dir: Path, device: str, reason: str) -> None:
+    safe_mkdir(state_dir, parents=True)
+    f = state_file(state_dir, device)
+    count = 0
+    if f.exists():
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.startswith("count="):
+                    count = int(line.split("=", 1)[1].strip())
+        except Exception:
+            count = 0
+    count += 1
+    f.write_text(
+        f"last_time={utc_now().isoformat()}\nreason={reason}\ncount={count}\n",
+        encoding="utf-8",
+    )
+
+
+def clear_failure(state_dir: Path, device: str) -> None:
+    try:
+        state_file(state_dir, device).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def read_failures_summary(state_dir: Path) -> list[tuple[str, str, str, str]]:
+    """
+    Returns list of (device, last_time, reason, count).
+    Best-effort; safe if files missing/partial.
+    """
+    out: list[tuple[str, str, str, str]] = []
+    try:
+        if not state_dir.exists():
+            return out
+        for p in sorted(state_dir.glob("*.failure")):
+            dev = p.stem
+            last_time = "-"
+            reason = "-"
+            count = "-"
+            try:
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("last_time="):
+                        last_time = line.split("=", 1)[1].strip()
+                    elif line.startswith("reason="):
+                        reason = line.split("=", 1)[1].strip()
+                    elif line.startswith("count="):
+                        count = line.split("=", 1)[1].strip()
+            except Exception:
+                pass
+            out.append((dev, last_time, reason, count))
+    except Exception:
+        return out
+    return out
+
+
+# ----------------------------
+# Auto-ignore perms (state/<device>.autoexclude)
+# ----------------------------
+
+def autoexclude_file(state_dir: Path, device: str) -> Path:
+    return state_dir / f"{device}.autoexclude"
+
+
+def load_autoexclude_patterns(state_dir: Path, device: str) -> list[str]:
+    p = autoexclude_file(state_dir, device)
+    try:
+        if not p.exists():
+            return []
+        lines = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            lines.append(s)
+        return lines
+    except Exception:
+        return []
+
+
+def save_autoexclude_patterns(
+    state_dir: Path,
+    device: str,
+    new_patterns: list[str],
+    *,
+    max_total: int,
+) -> tuple[int, int]:
+    """
+    Merge and persist patterns. Returns (added, total_after).
+    Best-effort and robust.
+    """
+    safe_mkdir(state_dir, parents=True)
+    p = autoexclude_file(state_dir, device)
+    existing = load_autoexclude_patterns(state_dir, device)
+    seen = set(existing)
+
+    added = 0
+    merged = list(existing)
+    for pat in new_patterns:
+        if pat in seen:
+            continue
+        merged.append(pat)
+        seen.add(pat)
+        added += 1
+        if max_total > 0 and len(merged) >= max_total:
+            break
+
+    try:
+        header = [
+            "# pull-backup autoexclude (permission denied paths)",
+            f"# device={device}",
+            f"# updated_utc={utc_now().isoformat()}",
+            "",
+        ]
+        p.write_text("\n".join(header + merged) + "\n", encoding="utf-8")
+    except Exception:
+        return (0, len(existing))
+
+    return (added, len(merged))
+
+
+# ----------------------------
+# Ledger (state/runs.jsonl)
+# ----------------------------
+
+def ledger_path(state_dir: Path) -> Path:
+    return state_dir / "runs.jsonl"
+
+
+def append_ledger(state_dir: Path, record: dict[str, Any]) -> None:
+    try:
+        safe_mkdir(state_dir, parents=True)
+        lp = ledger_path(state_dir)
+        line = json.dumps(record, sort_keys=True)
+        with open(lp, "a", encoding="utf-8") as fp:
+            fp.write(line + "\n")
+    except Exception:
+        # ledger must never break backup runs
+        pass
+
+
+def read_last_success_map(state_dir: Path) -> dict[str, dt.datetime]:
+    """
+    Return map device -> last successful end time (UTC) from runs.jsonl.
+    Best-effort and bounded (tail scan).
+    """
+    lp = ledger_path(state_dir)
+    if not lp.exists():
+        return {}
+    out: dict[str, dt.datetime] = {}
+    try:
+        # tail-ish: read last ~2MB
+        max_bytes = 2 * 1024 * 1024
+        with open(lp, "rb") as fp:
+            fp.seek(0, os.SEEK_END)
+            size = fp.tell()
+            start = max(0, size - max_bytes)
+            fp.seek(start, os.SEEK_SET)
+            data = fp.read().decode("utf-8", errors="replace")
+        for line in data.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") != "job":
+                continue
+            if rec.get("outcome") != "success":
+                continue
+            dev = str(rec.get("device", "")).strip()
+            end = str(rec.get("ts_end", "")).strip()
+            if not dev or not end:
+                continue
+            try:
+                d = dt.datetime.fromisoformat(end.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+            except Exception:
+                continue
+            cur = out.get(dev)
+            if cur is None or d > cur:
+                out[dev] = d
+    except Exception:
+        return out
+    return out
+
+
+# ----------------------------
+# Retention + log pruning
+# ----------------------------
+
+def prune_logs(log_dir: Path, keep_days: int) -> None:
+    cutoff = utc_now() - dt.timedelta(days=keep_days)
+    try:
+        paths = list(log_dir.glob("backup-*.log"))
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            return
+        raise
+    for p in paths:
+        try:
+            mtime = dt.datetime.fromtimestamp(p.stat().st_mtime, tz=dt.timezone.utc)
+            if mtime < cutoff:
+                p.unlink()
+        except Exception:
+            pass
+
+
+def retention(snap_dir: Path, legacy_root: Path, keep: int, action: str, log) -> None:
+    snaps = sorted([p for p in safe_list_dirs(snap_dir) if p.name.startswith("20")])
+    if len(snaps) <= keep:
+        return
+    old = snaps[: len(snaps) - keep]
+    log.state("RETENTION_SCAN", f"found {len(old)} snapshots older than keep={keep}")
+
+    act = (action or "").strip().lower()
+    # Back-compat: "quarantine" now means "legacy"
+    if act == "quarantine":
+        act = "legacy"
+
+    if act == "keep":
+        log.state("RETENTION", "action=keep (leaving older snapshots)")
+        return
+
+    if act == "legacy":
+        safe_mkdir(legacy_root, parents=True)
+        for d in old:
+            dst = legacy_root / d.name
+            log.state("RETENTION", f"legacy {d.name} -> {dst}")
+            d.rename(dst)
+        return
+
+    if act == "delete":
+        for d in old:
+            log.state("RETENTION", f"delete {d.name}")
+            shutil.rmtree(d)
+        return
+
+    raise RuntimeError(f"unknown retention action: {action}")
+
+
+# ----------------------------
+# SSH helpers (reachability = rsync-ready)
+# ----------------------------
+
+def ssh_cmd_base(ssh_config: Optional[Path]) -> list[str]:
+    base = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=8",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=2",
+    ]
+    if ssh_config and ssh_config.exists():
+        base += ["-F", str(ssh_config)]
+    return base
+
+
+def run_quick(cmd: list[str], *, timeout_s: int = 15) -> tuple[int, str]:
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_s,
+        )
+        return p.returncode, (p.stdout or "")
+    except subprocess.TimeoutExpired as e:
+        out = ""
+        if e.stdout:
+            out = str(e.stdout)
+        return 124, out + ("\n[local] probe timed out\n")
+
+
+def rsync_ready_probe(host: str, ssh_config: Optional[Path], *, timeout_s: int = 15) -> tuple[bool, str]:
+    cmd = ssh_cmd_base(ssh_config) + [host, "command -v rsync >/dev/null 2>&1 && echo RSYNC_OK"]
+    rc, out = run_quick(cmd, timeout_s=timeout_s)
+    ok = (rc == 0) and ("RSYNC_OK" in out)
+    return ok, out
+
+
+# ----------------------------
+# Resumable run tag + detection
+# ----------------------------
+
+def _inprogress_payload_present(inprog: Path) -> bool:
+    """
+    True if this in-progress dir looks like it has "real" payload (not just tag/partials dir).
+    Used to detect resumable work without mutating anything.
+    """
+    try:
+        if not inprog.exists() or not inprog.is_dir():
+            return False
+        allowed = {".run-tag", ".rsync-partial"}
+        for p in inprog.iterdir():
+            if p.name in allowed:
+                continue
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def has_resumable_inprogress(snap_dir: Path, device: str) -> tuple[bool, Optional[str]]:
+    """
+    Non-mutating check used during PREFLIGHT to prioritize resumes.
+    Returns (has_resume, tag_hint).
+    """
+    inprog = snap_dir / f".inprogress-{device}"
+    tagf = inprog / ".run-tag"
+    try:
+        if tagf.exists():
+            tag = tagf.read_text(encoding="utf-8").strip()
+            if tag:
+                return True, tag
+        if _inprogress_payload_present(inprog):
+            return True, None
+    except Exception:
+        pass
+    return False, None
+
+
+def load_or_create_run_tag(inprog: Path) -> tuple[str, bool, bool]:
+    """
+    Returns (tag, resumed, created_now)
+      - resumed=True means we are resuming a prior in-progress directory.
+      - created_now=True means we created .run-tag during this invocation.
+    """
+    tag_file = inprog / ".run-tag"
+    if tag_file.exists():
+        try:
+            tag = tag_file.read_text(encoding="utf-8").strip()
+            if tag:
+                return tag, True, False
+        except Exception:
+            pass
+
+    resumed = _inprogress_payload_present(inprog)
+    tag = utc_tag()
+    safe_mkdir(inprog, parents=True)
+    try:
+        tag_file.write_text(tag + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return tag, resumed, True
+
+
+def clear_run_tag_in_tree(tree: Path) -> None:
+    try:
+        (tree / ".run-tag").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def cleanup_new_empty_inprogress(inprog: Path) -> None:
+    """
+    Best-effort cleanup if we created an in-progress dir/tag this run but did not transfer anything.
+    Only removes if it looks empty-ish (i.e., no real payload).
+    """
+    try:
+        tagf = inprog / ".run-tag"
+        entries = [p.name for p in inprog.iterdir()]
+        allowed = {".run-tag", ".rsync-partial"}
+        if all(n in allowed for n in entries):
+            try:
+                tagf.unlink(missing_ok=True)
+            except Exception:
+                pass
+            rp = inprog / ".rsync-partial"
+            if rp.exists():
+                shutil.rmtree(rp, ignore_errors=True)
+            inprog.rmdir()
+    except Exception:
+        pass
+
+
+# ----------------------------
+# Dual logger
+# ----------------------------
+
+class DualLogger:
+    def __init__(self, *, job: str, log_fp):
+        self.job = job
+        self.fp = log_fp
+
+    def _emit(self, line: str) -> None:
+        if not line.endswith("\n"):
+            line += "\n"
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        self.fp.write(line)
+        self.fp.flush()
+
+    def state(self, state: str, msg: str) -> None:
+        ts = utc_now().strftime("%F %T")
+        self._emit(f"[{ts} UTC] [{self.job}] {state}: {msg}")
+
+    def raw(self, text: str) -> None:
+        if text == "":
+            return
+        if not text.endswith("\n"):
+            text += "\n"
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        self.fp.write(text)
+        self.fp.flush()
+
+
+# ----------------------------
+# Progress helpers (bytes so far)
+# ----------------------------
+
+def _fmt_bytes(n: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    x = float(n)
+    for u in units:
+        if x < 1024.0:
+            if u == "B":
+                return f"{int(x)}{u}"
+            return f"{x:.2f}{u}"
+        x /= 1024.0
+    return f"{x:.2f}EiB"
+
+
+def du_bytes(path: Path, *, timeout_s: int) -> Optional[int]:
+    """
+    Returns apparent size in bytes using `du -sb`.
+    None if du missing or fails.
+    """
+    try:
+        p = subprocess.run(
+            ["du", "-sb", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout_s,
+        )
+        if p.returncode != 0:
+            return None
+        first = (p.stdout or "").strip().split(None, 1)[0]
+        return int(first)
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def adaptive_du_timeout(base_s: int, bytes_hint: Optional[int]) -> int:
+    """
+    Dynamically increase du timeout as the in-progress tree grows.
+
+    - base_s is the user-configured floor (--du-timeout-s).
+    - We scale with log2(size) so it grows gently.
+    - Hard-capped to stay safe.
+    """
+    base = max(1, int(base_s))
+    b = max(0, int(bytes_hint or 0))
+    hard_cap = max(base, min(180, base * 6))
+    if b <= 0:
+        return base
+    gib = 1024 ** 3
+    steps = math.log2(1.0 + (b / gib))
+    scaled = int(round(base * (1.0 + 0.35 * steps)))
+    return max(base, min(hard_cap, scaled))
+
+
+# ----------------------------
+# Signal-safe runner (process group) + stall watchdog
+# ----------------------------
+
+class _Runner:
+    def __init__(self) -> None:
+        self.child_pgid: Optional[int] = None
+        self.signal_seen: Optional[int] = None
+
+
+RUNNER = _Runner()
+
+
+def _forward_signal(sig: int, _frame) -> None:
+    RUNNER.signal_seen = sig
+    if RUNNER.child_pgid is not None:
+        try:
+            os.killpg(RUNNER.child_pgid, sig)
+        except ProcessLookupError:
+            pass
+
+
+def _kill_pgrp(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def run_and_tee(
+    cmd: list[str],
+    log: DualLogger,
+    *,
+    kill_grace_s: int = 20,
+    wallclock_timeout_s: int = 0,
+    progress_path: Optional[Path] = None,
+    progress_interval_s: int = 60,
+    stall_timeout_s: int = 1800,
+    du_timeout_s: int = 20,
+    enable_progress: bool = True,
+    on_line: Optional[Callable[[str], None]] = None,
+) -> tuple[int, Optional[int], str, int]:
+    """
+    Runs cmd, tees stdout+stderr into DualLogger.
+
+    Adds:
+      - Periodic PROGRESS logging based on bytes in progress_path.
+      - Stall watchdog: triggers ONLY if BOTH:
+          * no dest byte growth, AND
+          * no rsync output activity
+        for stall_timeout_s seconds.
+
+    Returns: (rc, signal_seen, reason, stall_kills)
+    """
+    import selectors
+
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _forward_signal)
+    signal.signal(signal.SIGTERM, _forward_signal)
+
+    start = time.time()
+    last_progress_log = 0.0
+    last_bytes: Optional[int] = None
+    last_change = time.time()
+    last_output_time = time.time()
+
+    reason = "unknown"
+    rc = 1
+    sig_seen: Optional[int] = None
+    stall_kills = 0
+
+    sel: Optional[selectors.BaseSelector] = None
+    p: Optional[subprocess.Popen[str]] = None
+
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        assert p.stdout is not None
+        RUNNER.child_pgid = os.getpgid(p.pid)
+        RUNNER.signal_seen = None
+
+        sel = selectors.DefaultSelector()
+        sel.register(p.stdout, selectors.EVENT_READ)
+
+        def _note_output(line: str) -> None:
+            nonlocal last_output_time
+            last_output_time = time.time()
+            if on_line is not None:
+                try:
+                    on_line(line)
+                except Exception:
+                    pass
+
+        while True:
+            if p.poll() is not None:
+                try:
+                    rest = p.stdout.read()
+                    if rest:
+                        rest = rest.replace("\r", "\n")
+                        log.raw(rest)
+                        for ln in rest.splitlines():
+                            _note_output(ln)
+                except Exception:
+                    pass
+                break
+
+            now = time.time()
+
+            if wallclock_timeout_s > 0 and (now - start) > wallclock_timeout_s:
+                reason = "wallclock_timeout"
+                log.state("RUN_TIMEOUT", f"wallclock timeout exceeded ({wallclock_timeout_s}s); terminating rsync")
+                _kill_pgrp(RUNNER.child_pgid, signal.SIGTERM)
+                t0 = time.time()
+                while time.time() - t0 < kill_grace_s:
+                    if p.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                if p.poll() is None:
+                    log.state("RUN_TIMEOUT", "rsync did not exit after SIGTERM; sending SIGKILL")
+                    _kill_pgrp(RUNNER.child_pgid, signal.SIGKILL)
+                break
+
+            if enable_progress and progress_path and progress_interval_s > 0 and (now - last_progress_log) >= progress_interval_s:
+                du_to = adaptive_du_timeout(du_timeout_s, last_bytes)
+                b = du_bytes(progress_path, timeout_s=du_to)
+                if b is not None:
+                    if last_bytes is None:
+                        last_bytes = b
+                        last_change = now
+                    else:
+                        if b > last_bytes:
+                            last_change = now
+                        delta = b - last_bytes
+                        elapsed = max(1e-6, (now - last_progress_log) if last_progress_log > 0 else (now - start))
+                        rate = delta / elapsed
+                        last_bytes = b
+                        log.state(
+                            "PROGRESS",
+                            f"bytes={_fmt_bytes(b)} rate={_fmt_bytes(int(rate))}/s "
+                            f"stall_for={int(now - last_change)}s out_idle={int(now - last_output_time)}s du_timeout={du_to}s",
+                        )
+
+                    if stall_timeout_s > 0:
+                        no_growth = (now - last_change) >= stall_timeout_s
+                        no_output = (now - last_output_time) >= stall_timeout_s
+                        if no_growth and no_output:
+                            reason = "stall_timeout"
+                            stall_kills += 1
+                            log.state(
+                                "RUN_STALL",
+                                f"no byte growth AND no rsync output for {stall_timeout_s}s -> terminating rsync",
+                            )
+                            _kill_pgrp(RUNNER.child_pgid, signal.SIGTERM)
+                            t0 = time.time()
+                            while time.time() - t0 < kill_grace_s:
+                                if p.poll() is not None:
+                                    break
+                                time.sleep(0.2)
+                            if p.poll() is None:
+                                log.state("RUN_STALL", "rsync did not exit after SIGTERM; sending SIGKILL")
+                                _kill_pgrp(RUNNER.child_pgid, signal.SIGKILL)
+                            break
+                else:
+                    log.state("PROGRESS", f"du_bytes unavailable (no du / timed out) du_timeout={du_to}s")
+
+                last_progress_log = now
+
+            assert sel is not None
+            events = sel.select(timeout=0.5)
+            if not events:
+                continue
+
+            for key, _mask in events:
+                try:
+                    chunk = key.fileobj.readline()
+                except Exception:
+                    chunk = ""
+                if chunk:
+                    chunk = chunk.replace("\r", "\n")
+                    log.raw(chunk)
+                    for ln in chunk.splitlines():
+                        _note_output(ln)
+
+        rc = p.wait()
+        sig_seen = RUNNER.signal_seen
+        if sig_seen is not None:
+            reason = f"signal_{sig_seen}"
+        elif reason in ("wallclock_timeout", "stall_timeout"):
+            if rc == 0:
+                rc = 124
+        else:
+            reason = "exit"
+
+        return rc, sig_seen, reason, stall_kills
+
+    finally:
+        if sel is not None:
+            try:
+                sel.close()
+            except Exception:
+                pass
+
+        if RUNNER.child_pgid is not None:
+            try:
+                os.killpg(RUNNER.child_pgid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                _kill_pgrp(RUNNER.child_pgid, signal.SIGTERM)
+                t0 = time.time()
+                while time.time() - t0 < kill_grace_s:
+                    try:
+                        os.killpg(RUNNER.child_pgid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.2)
+                else:
+                    _kill_pgrp(RUNNER.child_pgid, signal.SIGKILL)
+
+        RUNNER.child_pgid = None
+        RUNNER.signal_seen = None
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+
+
+# ----------------------------
+# Load-shedding
+# ----------------------------
+
+def wait_for_load(max_load: float, log: DualLogger, poll_s: int = 10) -> None:
+    if max_load <= 0:
+        return
+    warned = False
+    while True:
+        try:
+            one, _five, _fifteen = os.getloadavg()
+        except OSError:
+            return
+        if one <= max_load:
+            return
+        if not warned:
+            log.state("LOAD_WAIT", f"loadavg(1m)={one:.2f} > max_load={max_load:.2f}; waiting")
+            warned = True
+        time.sleep(max(1, poll_s))
+
+
+# ----------------------------
+# Jobs config
+# ----------------------------
+
+def _as_list_str(v: Any) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out: list[str] = []
+        for x in v:
+            if x is None:
+                continue
+            s = str(x).strip()
+            if s:
+                out.append(s)
+        return out
+    # allow single string
+    s = str(v).strip()
+    return [s] if s else []
+
+
+def _is_safe_exclude_pattern(pat: str) -> bool:
+    # No absolute paths and no traversal.
+    if pat.startswith("/"):
+        return False
+    parts = [x for x in pat.replace("\\", "/").split("/") if x not in ("", ".")]
+    if any(x == ".." for x in parts):
+        return False
+    return True
+
+
+def _normalize_abs_exclude_to_root(pat: str, job_path: str) -> str:
+    """
+    If user provides an absolute path pattern, convert to anchored rsync exclude
+    relative to job_path, e.g.:
+      job_path=/home/klein/  abs=/home/klein/.foo -> /.foo
+    """
+    jp = job_path
+    if not jp.endswith("/"):
+        jp += "/"
+    if pat.startswith(jp):
+        rel = pat[len(jp):].lstrip("/")
+        return f"/{rel}"
+    # special case: job_path is "/" (or effectively root)
+    if jp == "/" and pat.startswith("/"):
+        return pat  # keep absolute anchor
+    raise RuntimeError(f"exclude pattern not under job.path: {pat} (job.path={job_path})")
+
+
+@dataclass(frozen=True)
+class Job:
+    device: str
+    ssh: str
+    path: str
+    when: str
+    description: str
+    klass: str
+    keep: int
+    action: str
+
+    # Back-compat: these must be optional with defaults so old callers/tests can do Job(...)
+    exclude: tuple[str, ...] = ()
+    exclude_file: str = ""
+
+    stall_timeout_s: int = 0
+    progress_interval_s: int = 0
+    du_timeout_s: int = 0
+
+    self_backup: bool = False
+
+
+def parse_jobs(cfg: dict[str, Any], defaults: dict[str, Any]) -> list[Job]:
+    jobs_raw = cfg.get("job", [])
+    if not isinstance(jobs_raw, list):
+        raise RuntimeError("jobs.toml must contain one or more [[job]] tables")
+    out: list[Job] = []
+    for j in jobs_raw:
+        if not isinstance(j, dict):
+            continue
+
+        device = str(j.get("device", "")).strip()
+        if not device:
+            continue
+
+        sshv = str(j.get("ssh", device)).strip()
+
+        path = str(j.get("path", f"/home/{device}/")).strip()
+        if not path.endswith("/"):
+            path += "/"
+
+        when = str(j.get("when", "daily")).strip()
+        desc = str(j.get("description", "")).strip()
+        klass = str(j.get("class", defaults["class"])).strip()
+
+        keep = int(j.get("keep", defaults["keep"]))
+        if keep < 1:
+            keep = 1
+
+        action = str(j.get("action", defaults["action"])).strip()
+
+        # excludes
+        excludes_in = _as_list_str(j.get("exclude", []))
+        excludes_norm: list[str] = []
+        for pat in excludes_in:
+            if pat.startswith("/"):
+                # allow absolute excludes only if they are under job.path; convert to anchored exclude
+                excludes_norm.append(_normalize_abs_exclude_to_root(pat, path))
+                continue
+            if not _is_safe_exclude_pattern(pat):
+                raise RuntimeError(f"unsafe exclude pattern for {device}: {pat!r}")
+            excludes_norm.append(pat)
+
+        excl_file = str(j.get("exclude_file", "")).strip()
+
+        # per-job progress/stall overrides (0/None means use global args)
+        stall_to = int(j.get("stall_timeout_s", 0) or 0)
+        prog_int = int(j.get("progress_interval_s", 0) or 0)
+        du_to = int(j.get("du_timeout_s", 0) or 0)
+
+        self_backup = bool(j.get("self_backup", False))
+
+        out.append(
+            Job(
+                device=device,
+                ssh=sshv,
+                path=path,
+                when=when,
+                description=desc,
+                klass=klass,
+                keep=keep,
+                action=action,
+                exclude=tuple(excludes_norm),
+                exclude_file=excl_file,
+                stall_timeout_s=stall_to,
+                progress_interval_s=prog_int,
+                du_timeout_s=du_to,
+                self_backup=self_backup,
+            )
+        )
+    return out
+
+
+# ----------------------------
+# Job outcome + summary
+# ----------------------------
+
+class Outcome(Enum):
+    SUCCESS = "success"
+    SOFT_SUCCESS = "soft_success"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    DEFERRED = "deferred"
+
+
+@dataclass
+class JobSummary:
+    job: Job
+    outcome: Outcome
+    reason: str
+    tag: Optional[str]
+    started: Optional[dt.datetime]
+    ended: Optional[dt.datetime]
+    attempts: int
+
+    # Back-compat: tests construct JobSummary with only the first 7 fields.
+    final_rc: Optional[int] = None
+    transient_rcs: tuple[int, ...] = ()
+    stall_kills: int = 0
+    perm_denied_paths: tuple[str, ...] = ()
+
+
+def _fmt_dur(s: JobSummary) -> str:
+    if not s.started or not s.ended:
+        return "-"
+    sec = (s.ended - s.started).total_seconds()
+    if sec < 0:
+        return "-"
+    if sec < 60:
+        return f"{int(sec)}s"
+    if sec < 3600:
+        return f"{int(sec//60)}m{int(sec%60)}s"
+    return f"{int(sec//3600)}h{int((sec%3600)//60)}m"
+
+
+def _worst_outcome(a: Outcome, b: Outcome) -> Outcome:
+    rank = {
+        Outcome.FAILED: 5,
+        Outcome.DEFERRED: 4,
+        Outcome.SOFT_SUCCESS: 3,
+        Outcome.SUCCESS: 2,
+        Outcome.SKIPPED: 1,
+    }
+    return a if rank[a] >= rank[b] else b
+
+
+def collapse_summaries_by_device(summaries: list[JobSummary]) -> list[JobSummary]:
+    """
+    Collapse multiple entries for the same device into one line-item while preserving
+    the "worst" outcome and surfacing all reasons/tags.
+    """
+    by_dev: dict[str, list[JobSummary]] = {}
+    for s in summaries:
+        by_dev.setdefault(s.job.device, []).append(s)
+
+    out: list[JobSummary] = []
+    for dev, items in sorted(by_dev.items(), key=lambda kv: kv[0]):
+        worst = items[0].outcome
+        for it in items[1:]:
+            worst = _worst_outcome(worst, it.outcome)
+
+        reasons: list[str] = []
+        for it in items:
+            if it.reason and it.reason not in reasons:
+                reasons.append(it.reason)
+
+        tag = None
+        for it in items:
+            if it.tag:
+                tag = it.tag
+                break
+
+        # TEST EXPECTATION (and intended semantics): attempts should SUM across entries.
+        attempts = sum(max(0, int(it.attempts)) for it in items)
+
+        # Combine ancillary fields conservatively
+        final_rc = None
+        for it in items:
+            if it.final_rc is not None:
+                final_rc = it.final_rc
+
+        transient: list[int] = []
+        for it in items:
+            transient.extend(list(it.transient_rcs))
+
+        stall_kills = sum(int(it.stall_kills) for it in items)
+
+        perm_paths: list[str] = []
+        for it in items:
+            perm_paths.extend(list(it.perm_denied_paths))
+
+        started_vals = [it.started for it in items if it.started is not None]
+        ended_vals = [it.ended for it in items if it.ended is not None]
+        started = min(started_vals) if started_vals else None
+        ended = max(ended_vals) if ended_vals else None
+
+        rep = items[0].job
+        out.append(
+            JobSummary(
+                rep,
+                worst,
+                "+".join(reasons) if reasons else worst.value,
+                tag,
+                started,
+                ended,
+                attempts,
+                final_rc,
+                tuple(transient),
+                stall_kills,
+                tuple(perm_paths),
+            )
+        )
+    return out
+
+
+def _ascii_table(rows: list[list[str]], headers: list[str]) -> str:
+    cols = len(headers)
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i in range(cols):
+            widths[i] = max(widths[i], len(r[i]))
+
+    def sep(ch: str = "-") -> str:
+        return "+ " + " + ".join(ch * w for w in widths) + " +"
+
+    def fmt_row(r: list[str]) -> str:
+        return "| " + " | ".join(r[i].ljust(widths[i]) for i in range(cols)) + " |"
+
+    out: list[str] = []
+    out.append(sep("-"))
+    out.append(fmt_row(headers))
+    out.append(sep("="))
+    for r in rows:
+        out.append(fmt_row(r))
+    out.append(sep("-"))
+    return "\n".join(out)
+
+
+# ----------------------------
+# Job metadata + ordering
+# ----------------------------
+
+@dataclass
+class JobMeta:
+    resumable: bool
+    resumable_tag_hint: Optional[str]
+    snap_count: int
+    last_snap_dt: Optional[dt.datetime]
+    prior_failure: bool
+    last_success_dt: Optional[dt.datetime]
+
+
+def job_snap_dir(backups_root: Path, j: Job) -> Path:
+    return backups_root / j.klass / j.device / "snapshots"
+
+
+def job_legacy_dir(backups_root: Path, j: Job) -> Path:
+    return backups_root / "legacy" / j.klass / j.device
+
+
+def collect_job_meta(
+    backups_root: Path,
+    state_dir: Path,
+    j: Job,
+    last_success_map: dict[str, dt.datetime],
+) -> JobMeta:
+    snap_dir = job_snap_dir(backups_root, j)
+    has_r, hint = has_resumable_inprogress(snap_dir, j.device)
+
+    snap_count = 0
+    last_dt: Optional[dt.datetime] = None
+    try:
+        snaps = [p for p in safe_list_dirs(snap_dir) if p.name.startswith("20")]
+        snap_count = len(snaps)
+        if snaps:
+            newest = sorted(snaps, key=lambda p: p.name)[-1].name
+            last_dt = parse_utc_tag(newest)
+    except Exception:
+        pass
+
+    pf = has_prior_failure(state_dir, j.device)
+    ls = last_success_map.get(j.device)
+    return JobMeta(has_r, hint, snap_count, last_dt, pf, ls)
+
+
+def priority_tuple(j: Job, m: JobMeta) -> tuple:
+    """
+    Lower tuple sorts earlier (higher priority).
+
+    Desired:
+      1) resumables first
+      2) prior failures next
+      3) oldest successful backup (ledger) next (older => higher priority)
+      4) oldest last snapshot next
+      5) fewer snapshots next
+      6) stable device name tie-breaker
+    """
+    now = utc_now()
+
+    if m.last_success_dt is None:
+        success_age_sec = 10**12
+    else:
+        success_age_sec = max(0.0, (now - m.last_success_dt).total_seconds())
+
+    if m.last_snap_dt is None:
+        snap_age_sec = 10**12
+    else:
+        snap_age_sec = max(0.0, (now - m.last_snap_dt).total_seconds())
+
+    return (
+        0 if m.resumable else 1,
+        0 if m.prior_failure else 1,
+        -success_age_sec,
+        -snap_age_sec,
+        m.snap_count,
+        j.device,
+    )
+
+
+# ----------------------------
+# Legacy -> archive worker (idle-time)
+# ----------------------------
+
+def _which(cmd: str) -> Optional[str]:
+    try:
+        return shutil.which(cmd)
+    except Exception:
+        return None
+
+
+def _iter_legacy_snapshots(backups_root: Path) -> list[tuple[str, str, Path]]:
+    """
+    Returns list of (klass, device, snapshot_dir_path) for legacy snapshots.
+    snapshot_dir_path points to .../legacy/<klass>/<device>/<tag>
+    """
+    out: list[tuple[str, str, Path]] = []
+    legacy_root = backups_root / "legacy"
+    try:
+        if not legacy_root.exists():
+            return out
+        for klass_dir in sorted([p for p in legacy_root.iterdir() if p.is_dir()]):
+            klass = klass_dir.name
+            for dev_dir in sorted([p for p in klass_dir.iterdir() if p.is_dir()]):
+                device = dev_dir.name
+                for snap in sorted([p for p in dev_dir.iterdir() if p.is_dir() and p.name.startswith("20")]):
+                    out.append((klass, device, snap))
+    except Exception:
+        return out
+    return out
+
+
+def archive_legacy_on_idle(
+    backups_root: Path,
+    *,
+    state_dir: Path,
+    level: int,
+    max_items: int,
+    max_total_bytes: int,
+    du_timeout_s: int,
+    max_load: float,
+) -> None:
+    ts = utc_now().strftime("%F %T")
+
+    if _which("tar") is None or _which("zstd") is None:
+        print(f"[{ts} UTC] [idle] ARCHIVE: tar/zstd not available; skipping legacy archive worker")
+        return
+
+    # lightweight load-shedding (no DualLogger here)
+    if max_load > 0:
+        try:
+            one, _five, _fifteen = os.getloadavg()
+            if one > max_load:
+                print(f"[{ts} UTC] [idle] ARCHIVE: loadavg(1m)={one:.2f} > max_load={max_load:.2f}; skipping")
+                return
+        except OSError:
+            pass
+
+    archives_root = backups_root / "archives"
+    legacy_items = _iter_legacy_snapshots(backups_root)
+    if not legacy_items:
+        print(f"[{ts} UTC] [idle] ARCHIVE: no legacy snapshots found")
+        return
+
+    def key_item(item: tuple[str, str, Path]) -> tuple:
+        _klass, _dev, p = item
+        d = parse_utc_tag(p.name)
+        if d is not None:
+            return (0, d)
+        try:
+            return (1, dt.datetime.fromtimestamp(p.stat().st_mtime, tz=dt.timezone.utc))
+        except Exception:
+            return (2, dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc))
+
+    legacy_items.sort(key=key_item)
+
+    done = 0
+    used_bytes = 0
+
+    for klass, dev, snapdir in legacy_items:
+        if max_items > 0 and done >= max_items:
+            break
+
+        est = du_bytes(snapdir, timeout_s=du_timeout_s) or 0
+
+        if max_total_bytes > 0 and (used_bytes + est) > max_total_bytes and done > 0:
+            print(f"[{ts} UTC] [idle] ARCHIVE: budget reached; stopping (used={used_bytes}B cap={max_total_bytes}B)")
+            break
+
+        out_dir = archives_root / klass / dev
+        safe_mkdir(out_dir, parents=True)
+
+        dest = out_dir / f"{snapdir.name}.tar.zst"
+        tmp = out_dir / f".{snapdir.name}.tar.zst.tmp"
+
+        if dest.exists():
+            try:
+                if dest.stat().st_size > 0:
+                    print(f"[{ts} UTC] [idle] ARCHIVE: already archived {dest}; removing legacy {snapdir}")
+                    shutil.rmtree(snapdir, ignore_errors=True)
+                    append_ledger(state_dir, {
+                        "type": "archive",
+                        "ts": utc_now().isoformat().replace("+00:00", "Z"),
+                        "class": klass,
+                        "device": dev,
+                        "tag": snapdir.name,
+                        "outcome": "already_archived_removed_legacy",
+                        "archive_path": str(dest),
+                    })
+                    done += 1
+                    continue
+            except Exception:
+                pass
+
+        parent = snapdir.parent
+        tagname = snapdir.name
+
+        print(f"[{ts} UTC] [idle] ARCHIVE: {klass}/{dev}/{tagname} -> {dest} (zstd level {level})")
+
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+        tar_cmd = ["tar", "-C", str(parent), "-cf", "-", tagname]
+        zstd_cmd = ["zstd", f"-{int(level)}", "-T0", "-q", "-o", str(tmp)]
+
+        try:
+            p1 = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert p1.stdout is not None
+            p2 = subprocess.Popen(zstd_cmd, stdin=p1.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            p1.stdout.close()
+
+            _t_err = p1.stderr.read().decode("utf-8", errors="replace") if p1.stderr else ""
+            _z_err = p2.stderr.read().decode("utf-8", errors="replace") if p2.stderr else ""
+
+            rc1 = p1.wait()
+            rc2 = p2.wait()
+
+            if rc1 != 0 or rc2 != 0:
+                print(f"[{ts} UTC] [idle] ARCHIVE: FAILED rc_tar={rc1} rc_zstd={rc2}")
+                if _t_err.strip():
+                    print(f"[{ts} UTC] [idle] ARCHIVE: tar stderr: {_t_err.strip()}")
+                if _z_err.strip():
+                    print(f"[{ts} UTC] [idle] ARCHIVE: zstd stderr: {_z_err.strip()}")
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                append_ledger(state_dir, {
+                    "type": "archive",
+                    "ts": utc_now().isoformat().replace("+00:00", "Z"),
+                    "class": klass,
+                    "device": dev,
+                    "tag": tagname,
+                    "outcome": "failed",
+                    "rc_tar": rc1,
+                    "rc_zstd": rc2,
+                })
+                continue
+
+            try:
+                if tmp.stat().st_size <= 0:
+                    print(f"[{ts} UTC] [idle] ARCHIVE: FAILED produced empty archive; keeping legacy {snapdir}")
+                    tmp.unlink(missing_ok=True)
+                    append_ledger(state_dir, {
+                        "type": "archive",
+                        "ts": utc_now().isoformat().replace("+00:00", "Z"),
+                        "class": klass,
+                        "device": dev,
+                        "tag": tagname,
+                        "outcome": "failed_empty_archive",
+                    })
+                    continue
+            except Exception:
+                pass
+
+            try:
+                tmp.replace(dest)
+            except Exception:
+                shutil.copy2(tmp, dest)
+                tmp.unlink(missing_ok=True)
+
+            shutil.rmtree(snapdir, ignore_errors=True)
+
+            used_bytes += est
+            done += 1
+
+            append_ledger(state_dir, {
+                "type": "archive",
+                "ts": utc_now().isoformat().replace("+00:00", "Z"),
+                "class": klass,
+                "device": dev,
+                "tag": tagname,
+                "outcome": "success",
+                "archive_path": str(dest),
+                "estimated_bytes": est,
+                "zstd_level": int(level),
+            })
+
+        except Exception as e:
+            print(f"[{ts} UTC] [idle] ARCHIVE: exception: {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            append_ledger(state_dir, {
+                "type": "archive",
+                "ts": utc_now().isoformat().replace("+00:00", "Z"),
+                "class": klass,
+                "device": dev,
+                "tag": tagname,
+                "outcome": "exception",
+                "error": str(e),
+            })
+            continue
+
+    if done > 0:
+        print(f"[{ts} UTC] [idle] ARCHIVE: completed {done} item(s)")
+    else:
+        print(f"[{ts} UTC] [idle] ARCHIVE: no items archived this run")
+
+
+# ----------------------------
+# Notifications (opt-in)
+# ----------------------------
+
+def _has_gui_env() -> bool:
+    # Minimal heuristics; systemd timer as root usually lacks these.
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and bool(
+        os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    )
+
+
+def try_notify(title: str, body: str, *, log: Optional[DualLogger] = None) -> None:
+    ts = utc_now().strftime("%F %T")
+    if _which("notify-send") is None:
+        if log:
+            log.state("NOTIFY_SKIP", "notify-send not installed")
+        else:
+            print(f"[{ts} UTC] [notify] NOTIFY_SKIP: notify-send not installed")
+        return
+    if not _has_gui_env():
+        if log:
+            log.state("NOTIFY_SKIP", "no DISPLAY/WAYLAND+DBUS session found")
+        else:
+            print(f"[{ts} UTC] [notify] NOTIFY_SKIP: no DISPLAY/WAYLAND+DBUS session found")
+        return
+    try:
+        subprocess.run(["notify-send", title, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    except Exception:
+        if log:
+            log.state("NOTIFY_SKIP", "notify-send failed")
+        else:
+            print(f"[{ts} UTC] [notify] NOTIFY_SKIP: notify-send failed")
+
+
+# ----------------------------
+# rsync output classification (permission denied)
+# ----------------------------
+
+# Examples:
+# rsync: [sender] send_files failed to open "...": Permission denied (13)
+# rsync: [sender] opendir "...": Permission denied (13)
+_PERM_DENIED_RE = re.compile(
+    r"""(?x)
+    (?:send_files\s+failed\s+to\s+open|opendir)\s+
+    "(?P<path>[^"]+)"\s*:\s*Permission\s+denied\s+\(13\)
+    """
+)
+
+# Other errors we consider "not purely permission denied"
+_OTHER_ERR_HINTS = (
+    "rsync error:",
+    "failed:",
+    "IO error",
+    "connection unexpectedly closed",
+    "error in socket IO",
+    "recv_generator",
+    "sender " "terminated",
+    "file has vanished",
+    "mkstemp",
+    "rename",
+    "chmod",
+    "chown",
+    "set times",
+    "xattr",
+    "acl",
+)
+
+
+def _extract_perm_denied_path(line: str) -> Optional[str]:
+    m = _PERM_DENIED_RE.search(line)
+    if not m:
+        return None
+    return m.group("path")
+
+
+def _is_other_error_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    # If it's a perm denied line, not "other"
+    if _extract_perm_denied_path(s) is not None:
+        return False
+    low = s.lower()
+    for h in _OTHER_ERR_HINTS:
+        if h.lower() in low:
+            return True
+    return False
+
+
+def _make_runtime_exclude_for_denied_path(denied_abs_path: str, job_path: str) -> Optional[str]:
+    """
+    Convert an absolute denied path into an anchored rsync exclude pattern
+    relative to job_path.
+
+    Returns pattern like "/.config/foo" (anchored at transfer root),
+    or None if it can't be made safe.
+    """
+    jp = job_path
+    if not jp.endswith("/"):
+        jp += "/"
+
+    p = denied_abs_path.strip()
+    if not p:
+        return None
+
+    # If rsync prints a relative path, keep it if safe.
+    if not p.startswith("/"):
+        if not _is_safe_exclude_pattern(p):
+            return None
+        # anchor relative paths at root for exact match
+        return f"/{p.lstrip('/')}"
+
+    # Absolute path: must be under job_path unless job_path is root
+    if jp == "/":
+        rel = p.lstrip("/")
+        if not _is_safe_exclude_pattern(rel):
+            return None
+        return f"/{rel}"
+
+    if p.startswith(jp):
+        rel = p[len(jp):].lstrip("/")
+        if not _is_safe_exclude_pattern(rel):
+            return None
+        return f"/{rel}"
+
+    return None
+
+
+# ----------------------------
+# Main per-job runner
+# ----------------------------
+
+def _is_local_job(job: Job) -> bool:
+    hn = ""
+    try:
+        hn = os.uname().nodename
+    except Exception:
+        pass
+    candidates = {job.device, hn}
+    ssh = (job.ssh or "").strip()
+    return ssh in ("localhost", "127.0.0.1") or (ssh in candidates and ssh != "")
+
+
+def _forced_excludes_for_job(job: Job, *, backups_root: Path) -> list[str]:
+    """
+    Prevent recursion / foot-guns for self-backup (local jobs).
+    Returns anchored rsync patterns (may be empty).
+    """
+    if not _is_local_job(job) and not job.self_backup:
+        return []
+
+    # Force-exclude backups root under the selected job.path if possible.
+    jp = job.path
+    if not jp.endswith("/"):
+        jp += "/"
+    br = str(backups_root)
+
+    patterns: list[str] = []
+
+    # If job path is root, exclude backups root as "/srv/storage/backups/**"
+    if jp == "/":
+        rel = br.lstrip("/")
+        patterns.append(f"/{rel}/**")
+        return patterns
+
+    # If backups_root is under job.path, exclude the relative path within job root
+    try:
+        if br.startswith(jp):
+            rel = br[len(jp):].lstrip("/")
+            if rel and _is_safe_exclude_pattern(rel):
+                patterns.append(f"/{rel}/**")
+    except Exception:
+        pass
+
+    # Optional default excludes for self_backup jobs (only when explicitly requested)
+    if job.self_backup:
+        defaults = [
+            "proc/**",
+            "sys/**",
+            "dev/**",
+            "run/**",
+            "tmp/**",
+            "var/cache/**",
+            "var/tmp/**",
+        ]
+        for d in defaults:
+            if _is_safe_exclude_pattern(d):
+                patterns.append(f"/{d}")
+
+    return patterns
+
+
+def run_one_job(
+    job: Job,
+    *,
+    backups_root: Path,
+    state_dir: Path,
+    ssh_config: Optional[Path],
+    args,
+) -> JobSummary:
+    started = utc_now()
+
+    dev_dir = backups_root / job.klass / job.device
+    snap_dir = dev_dir / "snapshots"
+    log_dir = dev_dir / "logs"
+    inprog = snap_dir / f".inprogress-{job.device}"
+    legacy_root = backups_root / "legacy" / job.klass / job.device
+
+    for p in (dev_dir, snap_dir, log_dir, inprog, legacy_root):
+        ensure_under(backups_root, p)
+
+    safe_mkdir(log_dir, parents=True)
+    safe_mkdir(snap_dir, parents=True)
+
+    tag, resumed, created_now = load_or_create_run_tag(inprog)
+    log_file = log_dir / f"backup-{job.device}-{tag}.log"
+
+    attempts = 0
+    transient_seen: list[int] = []
+    precheck_failures: int = 0
+    stall_kills_total = 0
+    perm_denied_abs_paths: list[str] = []
+    perm_denied_runtime_excludes: list[str] = []
+    other_error_lines_seen: int = 0
+
+    final_rc: Optional[int] = None
+
+    with open(log_file, "a" if log_file.exists() else "w", encoding="utf-8") as log_fp:
+        log = DualLogger(job=job.device, log_fp=log_fp)
+        src = f"{job.ssh}:{job.path}"
+
+        log.state("JOB_START", f"{'resume' if resumed else 'start'} tag={tag} class={job.klass} src={src}")
+        if job.description:
+            log.state("JOB_INFO", f"description={job.description}")
+
+        deep = bool(args.deep_verify or has_prior_failure(state_dir, job.device))
+
+        snaps = sorted([p for p in safe_list_dirs(snap_dir) if p.name.startswith("20")])
+        last_snap = snaps[-1] if snaps else None
+
+        # Effective per-job progress knobs
+        eff_stall_to = job.stall_timeout_s if job.stall_timeout_s > 0 else int(args.stall_timeout_s)
+        eff_prog_int = job.progress_interval_s if job.progress_interval_s > 0 else int(args.progress_interval_s)
+        eff_du_to = job.du_timeout_s if job.du_timeout_s > 0 else int(args.du_timeout_s)
+
+        rsync_opts = [
+            "-aHAXx",
+            "--numeric-ids",
+            "--partial",
+            "--partial-dir=.rsync-partial",
+            "--info=stats2,name0",
+            "--human-readable",
+        ]
+        if not args.no_compress:
+            rsync_opts.append("--compress")
+
+        if args.rsync_timeout and args.rsync_timeout > 0:
+            rsync_opts.append(f"--timeout={args.rsync_timeout}")
+
+        if args.rsync_stop_after_mins and args.rsync_stop_after_mins > 0:
+            rsync_opts.append(f"--stop-after={args.rsync_stop_after_mins}")
+
+        if args.bwlimit and args.bwlimit > 0:
+            rsync_opts.append(f"--bwlimit={args.bwlimit}")
+
+        if deep:
+            rsync_opts.append("--checksum")
+            log.state("JOB_MODE", "deep-verify enabled (--checksum) due to prior failure or flag")
+        if last_snap:
+            rsync_opts.append(f"--link-dest={last_snap}")
+
+        safe_mkdir(inprog, parents=True)
+
+        ssh_str = "ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+        if ssh_config and ssh_config.exists():
+            ssh_str += f" -F {shlex.quote(str(ssh_config))}"
+
+        soft_success_rcs = set() if args.strict_rsync else {23, 24}
+        transient_rcs = {12, 30, 35, 255}
+
+        # Excludes: (1) job exclude patterns, (2) job exclude-from, (3) autoexclude file,
+        # (4) forced excludes, (5) runtime excludes for perm denied paths.
+        forced_excludes = _forced_excludes_for_job(job, backups_root=backups_root)
+
+        autoexclude_enabled = bool(args.auto_ignore_perms)
+        autoexclude_patterns = load_autoexclude_patterns(state_dir, job.device) if autoexclude_enabled else []
+        autoexclude_path = autoexclude_file(state_dir, job.device) if (autoexclude_enabled and autoexclude_patterns) else None
+
+        def build_cmd(extra_runtime_excludes: list[str]) -> list[str]:
+            cmd = ["rsync"] + rsync_opts + ["-e", ssh_str]
+
+            # (1) explicit job excludes
+            for pat in job.exclude:
+                cmd.append(f"--exclude={pat}")
+
+            # (2) exclude_file from jobs.toml
+            if job.exclude_file:
+                ef = Path(job.exclude_file)
+                if not ef.exists():
+                    raise RuntimeError(f"exclude_file not found for {job.device}: {job.exclude_file}")
+                cmd.append(f"--exclude-from={str(ef)}")
+
+            # (3) autoexclude file (state)
+            if autoexclude_path is not None:
+                cmd.append(f"--exclude-from={str(autoexclude_path)}")
+
+            # (4) forced excludes (self/local safety)
+            for pat in forced_excludes:
+                cmd.append(f"--exclude={pat}")
+
+            # (5) runtime excludes
+            for pat in extra_runtime_excludes:
+                cmd.append(f"--exclude={pat}")
+
+            cmd += [src, str(inprog) + "/"]
+            return cmd
+
+        # Output classifier callback
+        def on_rsync_line(line: str) -> None:
+            nonlocal other_error_lines_seen
+            s = line.strip()
+            if not s:
+                return
+
+            pth = _extract_perm_denied_path(s)
+            if pth is not None:
+                perm_denied_abs_paths.append(pth)
+                return
+
+            if _is_other_error_line(s):
+                other_error_lines_seen += 1
+
+        terminal_ok = False
+        soft_succeeded = False
+        autoignore_reran = False
+
+        while attempts < max(1, int(args.attempts)):
+            attempts += 1
+
+            wait_for_load(args.max_load, log, poll_s=max(1, args.load_poll))
+
+            log.state("RUN_PRECHECK", f"attempt={attempts}: probing (ssh+rsync-ready)")
+            ok, out = rsync_ready_probe(job.ssh, ssh_config, timeout_s=args.ssh_probe_timeout)
+            if out.strip():
+                for line in out.splitlines():
+                    log.raw(f"[probe] {line}")
+
+            if not ok:
+                precheck_failures += 1
+                log.state("RUN_DEFER", f"endpoint not rsync-ready; deferring in this pass (attempt={attempts})")
+                mark_failure(state_dir, job.device, "ssh_or_rsync_unreachable")
+                prune_logs(log_dir, args.log_days)
+
+                if created_now and not resumed:
+                    log.state("CLEANUP", "removing newly-created empty in-progress dir (deferred before transfer)")
+                    cleanup_new_empty_inprogress(inprog)
+
+                ended = utc_now()
+                reason = "ssh_or_rsync_unreachable"
+                if precheck_failures > 1:
+                    reason += f" precheck_fails={precheck_failures}"
+                return JobSummary(
+                    job, Outcome.DEFERRED, reason, tag, started, ended, attempts,
+                    final_rc=None, transient_rcs=tuple(transient_seen),
+                    stall_kills=stall_kills_total, perm_denied_paths=tuple(),
+                )
+
+            # reset per-attempt collectors (but keep accumulated perm-denied list)
+            other_error_lines_seen = 0
+
+            cmd = build_cmd(extra_runtime_excludes=perm_denied_runtime_excludes)
+            log.state("RUN_START", f"attempt={attempts}: running rsync (cmd below)")
+            log.raw("[cmd] " + " ".join(shlex.quote(c) for c in cmd))
+
+            wall_s = int(args.wallclock_timeout_s) if args.wallclock_timeout_s else 0
+            rc, sig_seen, why, stalls = run_and_tee(
+                cmd,
+                log,
+                kill_grace_s=args.kill_grace_s,
+                wallclock_timeout_s=wall_s,
+                progress_path=inprog,
+                progress_interval_s=eff_prog_int,
+                stall_timeout_s=eff_stall_to,
+                du_timeout_s=eff_du_to,
+                enable_progress=(not args.no_progress),
+                on_line=on_rsync_line,
+            )
+            stall_kills_total += stalls
+            final_rc = rc
+
+            if sig_seen is not None or rc == 20:
+                log.state("RUN_INTERRUPTED", f"signal={sig_seen} rc={rc}; leaving partials for resume in {inprog}")
+                mark_failure(state_dir, job.device, "interrupted")
+                prune_logs(log_dir, args.log_days)
+                ended = utc_now()
+                return JobSummary(
+                    job, Outcome.FAILED, "interrupted", tag, started, ended, attempts,
+                    final_rc=final_rc, transient_rcs=tuple(transient_seen),
+                    stall_kills=stall_kills_total, perm_denied_paths=tuple(),
+                )
+
+            if rc == 0:
+                log.state("RUN_OK", f"rsync rc=0 ({why})")
+                terminal_ok = True
+                break
+
+            # Soft success path: attempt auto-ignore perms rerun once if eligible
+            if rc in soft_success_rcs:
+                if args.auto_ignore_perms and not autoignore_reran:
+                    seen_pat: set[str] = set(perm_denied_runtime_excludes)
+                    new_pats: list[str] = []
+                    for ap in perm_denied_abs_paths:
+                        pat = _make_runtime_exclude_for_denied_path(ap, job.path)
+                        if pat and pat not in seen_pat:
+                            new_pats.append(pat)
+                            seen_pat.add(pat)
+
+                    # eligible if there were permission denieds AND no other error hints
+                    if new_pats and other_error_lines_seen == 0:
+                        added, total_after = save_autoexclude_patterns(
+                            state_dir,
+                            job.device,
+                            new_pats,
+                            max_total=int(args.auto_ignore_max),
+                        )
+                        log.state("PERM_DENIED", f"auto-ignoring {len(new_pats)} path(s) (added={added} total={total_after})")
+                        cap = 20
+                        for pth in new_pats[:cap]:
+                            log.state("PERM_DENIED", f"exclude {pth}")
+                        if len(new_pats) > cap:
+                            log.state("PERM_DENIED", f"... {len(new_pats) - cap} more (see {autoexclude_file(state_dir, job.device)})")
+                        log.state("PERM_DENIED", f"saved to {autoexclude_file(state_dir, job.device)}")
+
+                        perm_denied_runtime_excludes.extend(new_pats)
+
+                        autoignore_reran = True
+                        log.state("RUN_AUTOIGNORE", "re-running rsync once to skip unreadable paths and aim for rc=0")
+                        other_error_lines_seen = 0
+                        cmd2 = build_cmd(extra_runtime_excludes=perm_denied_runtime_excludes)
+                        log.raw("[cmd] " + " ".join(shlex.quote(c) for c in cmd2))
+                        rc2, sig2, why2, stalls2 = run_and_tee(
+                            cmd2,
+                            log,
+                            kill_grace_s=args.kill_grace_s,
+                            wallclock_timeout_s=wall_s,
+                            progress_path=inprog,
+                            progress_interval_s=eff_prog_int,
+                            stall_timeout_s=eff_stall_to,
+                            du_timeout_s=eff_du_to,
+                            enable_progress=(not args.no_progress),
+                            on_line=on_rsync_line,
+                        )
+                        stall_kills_total += stalls2
+                        final_rc = rc2
+
+                        if sig2 is not None or rc2 == 20:
+                            log.state("RUN_INTERRUPTED", f"signal={sig2} rc={rc2}; leaving partials for resume in {inprog}")
+                            mark_failure(state_dir, job.device, "interrupted")
+                            prune_logs(log_dir, args.log_days)
+                            ended = utc_now()
+                            return JobSummary(
+                                job, Outcome.FAILED, "interrupted", tag, started, ended, attempts,
+                                final_rc=final_rc, transient_rcs=tuple(transient_seen),
+                                stall_kills=stall_kills_total,
+                                perm_denied_paths=tuple(perm_denied_abs_paths),
+                            )
+
+                        if rc2 == 0:
+                            log.state("RUN_OK", f"rsync rc=0 after auto-ignore ({why2})")
+                            terminal_ok = True
+                            soft_succeeded = False
+                            break
+
+                        rc = rc2
+
+                # If we are here and rc still in soft range, finalize as soft success
+                if rc in soft_success_rcs:
+                    soft_succeeded = True
+                    terminal_ok = True
+                    log.state(
+                        "RUN_SOFT",
+                        f"rsync rc={rc} treated as SOFT_SUCCESS; snapshot will be finalized (may be incomplete)",
+                    )
+                    mark_failure(state_dir, job.device, f"soft_rsync_rc_{rc}")
+                    break
+
+            if rc in transient_rcs:
+                transient_seen.append(rc)
+                log.state("RUN_RETRY", f"transient rsync rc={rc}; retrying ({attempts}/{args.attempts})")
+                mark_failure(state_dir, job.device, f"transient_rsync_rc_{rc}")
+                if args.retry_sleep > 0:
+                    time.sleep(args.retry_sleep)
+                continue
+
+            log.state("RUN_FAIL", f"non-transient rsync rc={rc}; leaving partials in {inprog}")
+            mark_failure(state_dir, job.device, f"rsync_rc_{rc}")
+            prune_logs(log_dir, args.log_days)
+            ended = utc_now()
+            reason = f"rsync_rc_{rc}"
+            if transient_seen:
+                reason += " transient=" + ",".join(str(x) for x in transient_seen)
+            return JobSummary(
+                job, Outcome.FAILED, reason, tag, started, ended, attempts,
+                final_rc=final_rc, transient_rcs=tuple(transient_seen),
+                stall_kills=stall_kills_total,
+                perm_denied_paths=tuple(perm_denied_abs_paths),
+            )
+
+        # ----------------------------
+        # Correctness: do NOT finalize unless terminal_ok
+        # ----------------------------
+        if not terminal_ok:
+            reason = f"attempts_exhausted(last_rc={final_rc})"
+            log.state("RUN_EXHAUSTED", f"{reason}; leaving partials for resume in {inprog}")
+            mark_failure(state_dir, job.device, reason)
+            prune_logs(log_dir, args.log_days)
+            ended = utc_now()
+
+            append_ledger(state_dir, {
+                "type": "job",
+                "ts_start": started.isoformat().replace("+00:00", "Z"),
+                "ts_end": ended.isoformat().replace("+00:00", "Z"),
+                "device": job.device,
+                "class": job.klass,
+                "tag": tag,
+                "outcome": "failed",
+                "reason": reason,
+                "attempts": attempts,
+                "final_rc": final_rc,
+                "transient_rcs": transient_seen,
+                "stall_kills": stall_kills_total,
+                "perm_denied_count": len(perm_denied_abs_paths),
+                "perm_denied_sample": perm_denied_abs_paths[:10],
+            })
+
+            if args.notify:
+                try_notify(
+                    f"pull-backup: {job.device} FAILED",
+                    f"{reason} (attempts={attempts})",
+                    log=log,
+                )
+
+            return JobSummary(
+                job, Outcome.FAILED, reason, tag, started, ended, attempts,
+                final_rc=final_rc, transient_rcs=tuple(transient_seen),
+                stall_kills=stall_kills_total,
+                perm_denied_paths=tuple(perm_denied_abs_paths),
+            )
+
+        # ----------------------------
+        # Finalize snapshot (success or soft-success only)
+        # ----------------------------
+        final = snap_dir / tag
+        if final.exists():
+            shutil.rmtree(final)
+
+        log.state("FINALIZE", f"renaming in-progress -> final: {inprog} -> {final}")
+        inprog.rename(final)
+        clear_run_tag_in_tree(final)
+
+        cur = snap_dir / "current"
+        try:
+            if cur.is_symlink() or cur.exists():
+                cur.unlink()
+        except FileNotFoundError:
+            pass
+        cur.symlink_to(final)
+        log.state("FINALIZE", f"updated current -> {final}")
+
+        # Retention
+        act = (job.action or "").strip().lower()
+        if act == "delete" and not args.auto:
+            log.state("RETENTION", "action=delete but --auto not set; skipping deletion")
+        else:
+            retention(snap_dir, legacy_root, job.keep, job.action, log)
+
+        prune_logs(log_dir, args.log_days)
+
+        outcome = Outcome.SOFT_SUCCESS if soft_succeeded else Outcome.SUCCESS
+        ended = utc_now()
+
+        snap_bytes = du_bytes(final, timeout_s=max(5, eff_du_to)) or None
+
+        if soft_succeeded:
+            reason = f"soft_success(rc={final_rc})" if final_rc is not None else "soft_success"
+            mark_failure(state_dir, job.device, reason)
+        else:
+            reason = "success"
+            if transient_seen:
+                reason += " recovered_from=" + ",".join(str(x) for x in transient_seen)
+            clear_failure(state_dir, job.device)
+
+        log.state("JOB_DONE", f"outcome={outcome.value} attempts={attempts}")
+
+        append_ledger(state_dir, {
+            "type": "job",
+            "ts_start": started.isoformat().replace("+00:00", "Z"),
+            "ts_end": ended.isoformat().replace("+00:00", "Z"),
+            "device": job.device,
+            "class": job.klass,
+            "tag": tag,
+            "outcome": outcome.value,
+            "reason": reason,
+            "attempts": attempts,
+            "final_rc": final_rc,
+            "transient_rcs": transient_seen,
+            "stall_kills": stall_kills_total,
+            "perm_denied_count": len(perm_denied_abs_paths),
+            "perm_denied_sample": perm_denied_abs_paths[:10],
+            "snapshot_bytes_est": snap_bytes,
+            "autoignore_reran": autoignore_reran,
+        })
+
+        if args.notify:
+            title = f"pull-backup: {job.device} {outcome.value}"
+            body = f"tag={tag} attempts={attempts}"
+            if soft_succeeded and final_rc is not None:
+                body += f" rc={final_rc}"
+            try_notify(title, body, log=log)
+
+        return JobSummary(
+            job, outcome, reason, tag, started, ended, attempts,
+            final_rc=final_rc, transient_rcs=tuple(transient_seen),
+            stall_kills=stall_kills_total,
+            perm_denied_paths=tuple(perm_denied_abs_paths),
+        )
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Pull backups over SSH (WireGuard), snapshot+retention.")
+    ap.add_argument("--daemon", action="store_true", help="run scheduled jobs from jobs.toml")
+    ap.add_argument("--jobs-file", default="/etc/pull-backup/jobs.toml")
+    ap.add_argument("--backups-root", default="/srv/storage/backups")
+    ap.add_argument("--state-dir", default="/var/lib/pull-backup/state")
+    ap.add_argument("--class", dest="klass", default="laptops")
+    ap.add_argument("--keep", type=int, default=3)
+    ap.add_argument(
+        "--action",
+        choices=["legacy", "quarantine", "delete", "keep"],
+        default="quarantine",
+        help="retention action; 'quarantine' kept for compatibility but now writes into legacy/",
+    )
+    ap.add_argument("--log-days", type=int, default=30)
+    ap.add_argument("--auto", action="store_true", help="allow destructive actions like retention delete")
+    ap.add_argument("--deep-verify", action="store_true", help="force rsync --checksum")
+    ap.add_argument("--ssh-config", default="/root/.ssh/config")
+    ap.add_argument("--lock-file", default="/run/pull-backup/lock")
+
+    ap.add_argument("--attempts", type=int, default=2)
+    ap.add_argument("--retry-sleep", type=int, default=10)
+    ap.add_argument("--passes", type=int, default=2)
+    ap.add_argument("--pass-delay", type=int, default=120)
+
+    ap.add_argument("--ssh-probe-timeout", type=int, default=12)
+
+    ap.add_argument(
+        "--rsync-timeout",
+        type=int,
+        default=0,
+        help="rsync --timeout idle-I/O seconds (0 disables; recommended 0 with stall watchdog)",
+    )
+    ap.add_argument("--rsync-stop-after-mins", type=int, default=0)
+    ap.add_argument("--bwlimit", type=int, default=0)
+    ap.add_argument("--no-compress", action="store_true")
+    ap.add_argument("--strict-rsync", action="store_true")
+
+    ap.add_argument("--wallclock-timeout-s", type=int, default=0)
+    ap.add_argument("--kill-grace-s", type=int, default=20)
+
+    ap.add_argument("--max-load", type=float, default=4.0)
+    ap.add_argument("--load-poll", type=int, default=10)
+
+    ap.add_argument("--exit-soft-nonzero", action="store_true")
+
+    ap.add_argument(
+        "--ignore-when",
+        action="store_true",
+        help="ignore job 'when' schedule and run ALL jobs (manual/test force-run)",
+    )
+
+    # Resume outside schedule (new name) + back-compat alias flags
+    ap.add_argument(
+        "--resume-outside-when",
+        action="store_true",
+        default=True,
+        help="attempt resumable jobs even if schedule doesn't match (default on)",
+    )
+    ap.add_argument(
+        "--resume-outside-when-max",
+        type=int,
+        default=1,
+        help="max resumable jobs to run when no jobs match schedule (default 1; 0 = no limit)",
+    )
+
+    # Back-compat flags (keep, but hidden-ish in help)
+    ap.add_argument("--idle-resume", action="store_true", default=True, help=argparse.SUPPRESS)
+    ap.add_argument("--idle-resume-max", type=int, default=1, help=argparse.SUPPRESS)
+
+    ap.add_argument(
+        "--archive-legacy-on-idle",
+        action="store_true",
+        default=True,
+        help="when truly idle (no scheduled jobs and no resumables), archive legacy snapshots to archives/ (default on)",
+    )
+    ap.add_argument("--archive-zstd-level", type=int, default=12)
+    ap.add_argument("--archive-max-items", type=int, default=1)
+    ap.add_argument("--archive-max-bytes", type=int, default=50 * 1024**3)
+
+    ap.add_argument("--progress-interval-s", type=int, default=60)
+    ap.add_argument("--stall-timeout-s", type=int, default=1800)
+    ap.add_argument("--du-timeout-s", type=int, default=20)
+    ap.add_argument("--no-progress", action="store_true")
+
+    # Auto-ignore permission denied paths
+    ap.add_argument(
+        "--auto-ignore-perms",
+        action="store_true",
+        default=True,
+        help="auto-ignore unreadable (Permission denied) paths (default on)",
+    )
+    ap.add_argument(
+        "--auto-ignore-max",
+        type=int,
+        default=200,
+        help="cap total autoignored paths per device (default 200; 0 disables cap)",
+    )
+
+    # Notifications
+    ap.add_argument("--notify", action="store_true", help="send notify-send notifications (opt-in)")
+
+    args = ap.parse_args()
+    os.umask(0o077)
+
+    backups_root = Path(args.backups_root).resolve()
+    if str(backups_root) != "/srv/storage/backups":
+        raise RuntimeError("backups-root must be exactly /srv/storage/backups")
+    if not args.daemon:
+        raise RuntimeError("Use --daemon (this tool is scheduler-driven).")
+
+    lock_path = Path(args.lock_file)
+    safe_mkdir(lock_path.parent, parents=True)
+
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX)
+
+        assert_backups_root_ready(backups_root)
+
+        state_dir = Path(args.state_dir)
+        cfg_path = Path(args.jobs_file)
+        defaults = {"class": args.klass, "keep": args.keep, "action": args.action}
+
+        cfg = load_toml(cfg_path)
+        jobs_all = parse_jobs(cfg, defaults)
+
+        failures = read_failures_summary(state_dir)
+        ts = utc_now().strftime("%F %T")
+        if failures:
+            print(f"[{ts} UTC] [state] prior failures:")
+            for dev, last_time, reason, count in failures:
+                print(f"[{ts} UTC] [state]  - {dev}: last_time={last_time} count={count} reason={reason}")
+
+        if args.ignore_when:
+            print(f"[{ts} UTC] [daemon] IGNORE_WHEN: running all jobs regardless of schedule")
+
+        last_success_map = read_last_success_map(state_dir)
+
+        metas: dict[str, JobMeta] = {}
+        for j in jobs_all:
+            metas[j.device] = collect_job_meta(backups_root, state_dir, j, last_success_map)
+
+        ssh_config = Path(args.ssh_config) if args.ssh_config else None
+
+        scheduled: list[Job] = []
+        skipped: list[Job] = []
+        for j in jobs_all:
+            if args.ignore_when or when_matches_today(j.when):
+                scheduled.append(j)
+            else:
+                skipped.append(j)
+
+        resumables: list[Job] = []
+        for j in jobs_all:
+            m = metas.get(j.device)
+            if m and m.resumable:
+                resumables.append(j)
+
+        resume_outside = bool(args.resume_outside_when or args.idle_resume)
+        resume_cap = int(args.resume_outside_when_max) if args.resume_outside_when_max is not None else int(args.idle_resume_max)
+
+        if args.ignore_when:
+            runnable = list(jobs_all)
+            skipped = []
+        else:
+            runnable = []
+            seen: set[str] = set()
+            for j in scheduled:
+                if j.device not in seen:
+                    runnable.append(j)
+                    seen.add(j.device)
+
+            if resume_outside or scheduled:
+                for j in resumables:
+                    if j.device not in seen:
+                        runnable.append(j)
+                        seen.add(j.device)
+
+        if not args.ignore_when:
+            ts = utc_now().strftime("%F %T")
+            for j in skipped:
+                m = metas.get(j.device)
+                if m and m.resumable and resume_outside:
+                    continue
+                print(f"[{ts} UTC] [daemon] skip {j.device} (when={j.when})")
+
+        if not runnable:
+            ts = utc_now().strftime("%F %T")
+            print(f"[{ts} UTC] [daemon] no jobs to run today (no scheduled and no resumables)")
+            if args.archive_legacy_on_idle:
+                archive_legacy_on_idle(
+                    backups_root,
+                    state_dir=state_dir,
+                    level=max(1, min(22, int(args.archive_zstd_level))),
+                    max_items=max(0, int(args.archive_max_items)),
+                    max_total_bytes=max(0, int(args.archive_max_bytes)),
+                    du_timeout_s=max(5, int(args.du_timeout_s)),
+                    max_load=float(args.max_load),
+                )
+            if args.notify:
+                try_notify("pull-backup: idle", "no jobs; archive worker ran (if enabled)")
+            return 0
+
+        if (not args.ignore_when) and (len(scheduled) == 0) and resumables and resume_outside:
+            cap = int(resume_cap)
+            if cap > 0 and len(runnable) > cap:
+                runnable.sort(key=lambda j: priority_tuple(j, metas.get(j.device)))
+                runnable = runnable[:cap]
+                ts = utc_now().strftime("%F %T")
+                print(f"[{ts} UTC] [idle] RESUME_CAP: limiting resumables to {cap} job(s) this run")
+
+        res_list = [j for j in runnable if metas.get(j.device, JobMeta(False, None, 0, None, False, None)).resumable]
+        if res_list:
+            ts = utc_now().strftime("%F %T")
+            for j in res_list:
+                m = metas.get(j.device)
+                hint = m.resumable_tag_hint if m else None
+                hint_s = f" tag_hint={hint}" if hint else ""
+                print(f"[{ts} UTC] [run] RESUME_DETECT: {j.device}{hint_s}")
+
+        summaries: list[JobSummary] = []
+        if not args.ignore_when:
+            for j in skipped:
+                m = metas.get(j.device)
+                if m and m.resumable and resume_outside:
+                    continue
+                summaries.append(
+                    JobSummary(
+                        j, Outcome.SKIPPED, f"when={j.when}", None, None, None, 0,
+                        final_rc=None, transient_rcs=tuple(), stall_kills=0, perm_denied_paths=tuple(),
+                    )
+                )
+
+        passes = max(1, int(args.passes))
+        pending: list[Job] = list(runnable)
+
+        for pidx in range(passes):
+            pass_no = pidx + 1
+            ts = utc_now().strftime("%F %T")
+            print(f"[{ts} UTC] [run] PASS_START: {pass_no}/{passes} candidates={len(pending)}")
+
+            if not pending:
+                print(f"[{ts} UTC] [run] PASS_EMPTY: nothing to run in pass {pass_no}")
+                continue
+
+            print(f"[{ts} UTC] [run] PREFLIGHT: probing {len(pending)} endpoints (ssh+rsync-ready)")
+            reachable: list[Job] = []
+            unreachable: list[tuple[Job, str]] = []
+
+            for j in pending:
+                ok, out = rsync_ready_probe(j.ssh, ssh_config, timeout_s=args.ssh_probe_timeout)
+                if ok:
+                    reachable.append(j)
+                else:
+                    reason = "not_rsync_ready"
+                    if out.strip():
+                        reason = "not_rsync_ready_with_output"
+                    unreachable.append((j, reason))
+
+            ts = utc_now().strftime("%F %T")
+            print(f"[{ts} UTC] [run] PREFLIGHT: reachable={len(reachable)} unreachable={len(unreachable)}")
+            for j, r in unreachable:
+                print(f"[{ts} UTC] [run] PREFLIGHT_DEFER: {j.device} ({j.ssh}) reason={r}")
+
+            last_success_map = read_last_success_map(state_dir)
+            for j in pending:
+                metas[j.device] = collect_job_meta(backups_root, state_dir, j, last_success_map)
+
+            reachable_sorted = sorted(reachable, key=lambda j: priority_tuple(j, metas.get(j.device)))
+
+            ts = utc_now().strftime("%F %T")
+            if reachable_sorted:
+                print(f"[{ts} UTC] [run] PREFLIGHT_ORDER: reachable run order:")
+                for j in reachable_sorted:
+                    m = metas.get(j.device)
+                    last_snap = m.last_snap_dt.isoformat() if (m and m.last_snap_dt) else "-"
+                    last_ok = m.last_success_dt.isoformat() if (m and m.last_success_dt) else "-"
+                    flags = []
+                    if m and m.resumable:
+                        flags.append("RESUME")
+                    if m and m.prior_failure:
+                        flags.append("PRIOR_FAIL")
+                    flags_s = ",".join(flags) if flags else "normal"
+                    print(f"[{ts} UTC] [run]  - {j.device} ({flags_s}) snaps={m.snap_count if m else 0} last_snap={last_snap} last_success={last_ok}")
+
+            next_pending: list[Job] = []
+            next_pending.extend([j for (j, _r) in unreachable])
+
+            if reachable_sorted:
+                for job in reachable_sorted:
+                    s = run_one_job(
+                        job,
+                        backups_root=backups_root,
+                        state_dir=state_dir,
+                        ssh_config=ssh_config,
+                        args=args,
+                    )
+                    summaries.append(s)
+
+                    if s.outcome == Outcome.DEFERRED and pass_no < passes:
+                        next_pending.append(job)
+
+            pending = next_pending
+
+            ts = utc_now().strftime("%F %T")
+            print(f"[{ts} UTC] [run] PASS_END: {pass_no}/{passes} deferred_for_next_pass={len(pending)}")
+
+            if pass_no < passes and args.pass_delay > 0 and pending:
+                print(f"[{ts} UTC] [run] PASS_SLEEP: sleeping {args.pass_delay}s before next pass")
+                time.sleep(args.pass_delay)
+
+        collapsed = collapse_summaries_by_device(summaries)
+        hard_fail = any(s.outcome == Outcome.FAILED for s in collapsed)
+        soft = any(s.outcome == Outcome.SOFT_SUCCESS for s in collapsed)
+
+        counts = {o: 0 for o in Outcome}
+        for s in collapsed:
+            counts[s.outcome] += 1
+
+        rows: list[list[str]] = []
+        for s in collapsed:
+            rows.append([
+                s.job.device,
+                s.outcome.value,
+                str(s.attempts),
+                _fmt_dur(s),
+                (s.tag or "-"),
+                (s.reason or "-"),
+            ])
+
+        ts = utc_now().strftime("%F %T")
+        print(f"[{ts} UTC] [summary] ------------------------------")
+        print(f"[{ts} UTC] [summary] totals: "
+              f"success={counts[Outcome.SUCCESS]} "
+              f"soft_success={counts[Outcome.SOFT_SUCCESS]} "
+              f"failed={counts[Outcome.FAILED]} "
+              f"deferred={counts[Outcome.DEFERRED]} "
+              f"skipped={counts[Outcome.SKIPPED]}")
+        print(_ascii_table(rows, headers=["device", "outcome", "attempts", "dur", "tag", "issues"]))
+        print(f"[{ts} UTC] [summary] ------------------------------")
+
+        if args.notify:
+            title = "pull-backup: completed"
+            body = f"success={counts[Outcome.SUCCESS]} soft={counts[Outcome.SOFT_SUCCESS]} failed={counts[Outcome.FAILED]} deferred={counts[Outcome.DEFERRED]}"
+            try_notify(title, body)
+
+        if hard_fail:
+            return 1
+        if soft and args.exit_soft_nonzero:
+            return 2
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RuntimeError as e:
+        print(f"[fatal] {e}", file=sys.stderr)
+        msg = str(e).lower()
+        if "backup filesystem not available" in msg or "stale mount" in msg:
+            raise SystemExit(3)
+        raise SystemExit(4)
+    except Exception as e:
+        print(f"[fatal] {e}", file=sys.stderr)
+        raise SystemExit(1)
+

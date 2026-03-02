@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""
+pull-backup: Pull backups over SSH (WireGuard), snapshot+retention.
+
+Design goals:
+- Clear, explicit job state machine with dual-logging (journald + per-job logfile).
+- Avoid stalling the whole run when a single endpoint is offline:
+  - Preflight reachability check
+  - Pass 1: run reachable jobs
+  - Defer: unreachable or transient-failing jobs
+  - Pass 2: retry deferred jobs near the end
+- Robust rsync execution:
+  - Optional rsync idle timeout (--timeout)
+  - Optional rsync wall-clock cap (--stop-after)
+  - Signal-safe process group handling for systemd stop / Ctrl+C
+- Resumable snapshots via snapshots/.inprogress-<device>/.run-tag
+
+Exit codes:
+- 0: no hard failures (soft-success allowed unless --exit-soft-nonzero)
+- 1: at least one hard failure
+- 2: only soft-success issues (only if --exit-soft-nonzero)
+- 3: fatal environment error (backup filesystem missing/stale, etc.)
+- 4: config/usage error
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import errno
+import fcntl
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any, Optional, Tuple
+
+
+# ----------------------------
+# FS error helpers
+# ----------------------------
+
+_FS_BAD_ERRNOS = {errno.ENODEV, errno.ESTALE, errno.EIO}
+
+
+def _is_bad_fs_error(e: BaseException) -> bool:
+    return isinstance(e, OSError) and getattr(e, "errno", None) in _FS_BAD_ERRNOS
+
+
+def _bad_fs(msg: str) -> RuntimeError:
+    return RuntimeError(msg)
+
+
+def safe_mkdir(path: Path, *, parents: bool = False) -> None:
+    try:
+        path.mkdir(parents=parents, exist_ok=True)
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            raise _bad_fs(f"backup filesystem not available at {path} (stale mount / missing device)")
+        raise
+    except Exception as e:
+        try:
+            _ = os.stat(str(path))
+        except OSError as oe:
+            if _is_bad_fs_error(oe):
+                raise _bad_fs(f"backup filesystem not available at {path} (stale mount / missing device)")
+        raise e
+
+
+def statvfs_free_bytes(path: Path) -> int:
+    try:
+        st = os.statvfs(str(path))
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            raise _bad_fs(f"backup filesystem not available at {path} (stale mount / missing device)")
+        raise
+    return st.f_frsize * st.f_bavail
+
+
+def assert_backups_root_ready(backups_root: Path) -> None:
+    try:
+        if not backups_root.exists():
+            raise RuntimeError(f"backups root does not exist: {backups_root}")
+        if not backups_root.is_dir():
+            raise RuntimeError(f"backups root is not a directory: {backups_root}")
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            raise _bad_fs(f"backup filesystem not available at {backups_root} (stale mount / missing device)")
+        raise
+    _ = statvfs_free_bytes(backups_root)
+
+
+def safe_list_dirs(dirpath: Path) -> list[Path]:
+    try:
+        return [p for p in dirpath.iterdir() if p.is_dir()]
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            raise _bad_fs(f"backup filesystem not available while listing {dirpath} ({e})")
+        raise
+
+
+def ensure_under(root: Path, p: Path) -> None:
+    root = root.resolve()
+    p = p.resolve(strict=False)
+    try:
+        p.relative_to(root)
+    except ValueError:
+        raise RuntimeError(f"path escapes root: {p} (root={root})")
+
+
+# ----------------------------
+# TOML loading
+# ----------------------------
+
+def load_toml(path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
+    try:
+        import tomllib  # py3.11+
+        return tomllib.loads(data.decode("utf-8"))
+    except Exception:
+        try:
+            import tomli  # type: ignore
+            return tomli.loads(data.decode("utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse TOML: {path} ({e})")
+
+
+# ----------------------------
+# Time helpers
+# ----------------------------
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def utc_tag() -> str:
+    return utc_now().strftime("%Y%m%d-%H%M%SZ")
+
+
+def iso_wd_and_name_local() -> Tuple[str, str]:
+    n = now_local()
+    return str(n.isoweekday()), n.strftime("%a")
+
+
+# ----------------------------
+# Schedule matching
+# ----------------------------
+
+def when_matches_today(when: str) -> bool:
+    when = (when or "").strip().strip('"').strip("'")
+    if when == "" or when == "*" or when.lower() == "daily":
+        return True
+    iso, name = iso_wd_and_name_local()
+    parts = [p.strip() for p in when.split(",") if p.strip()]
+    for p in parts:
+        if p == iso or p.lower() == name.lower():
+            return True
+    return False
+
+
+# ----------------------------
+# State tracking (OFF backup mount)
+# ----------------------------
+
+def state_file(state_dir: Path, device: str) -> Path:
+    return state_dir / f"{device}.failure"
+
+
+def has_prior_failure(state_dir: Path, device: str) -> bool:
+    f = state_file(state_dir, device)
+    try:
+        return f.exists()
+    except OSError:
+        return False
+
+
+def mark_failure(state_dir: Path, device: str, reason: str) -> None:
+    safe_mkdir(state_dir, parents=True)
+    f = state_file(state_dir, device)
+    count = 0
+    if f.exists():
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.startswith("count="):
+                    count = int(line.split("=", 1)[1].strip())
+        except Exception:
+            count = 0
+    count += 1
+    f.write_text(
+        f"last_time={utc_now().isoformat()}\nreason={reason}\ncount={count}\n",
+        encoding="utf-8",
+    )
+
+
+def clear_failure(state_dir: Path, device: str) -> None:
+    try:
+        state_file(state_dir, device).unlink()
+    except FileNotFoundError:
+        pass
+
+
+# ----------------------------
+# Retention + log pruning
+# ----------------------------
+
+def prune_logs(log_dir: Path, keep_days: int) -> None:
+    cutoff = utc_now() - dt.timedelta(days=keep_days)
+    try:
+        paths = list(log_dir.glob("backup-*.log"))
+    except OSError as e:
+        if _is_bad_fs_error(e):
+            return
+        raise
+    for p in paths:
+        try:
+            mtime = dt.datetime.fromtimestamp(p.stat().st_mtime, tz=dt.timezone.utc)
+            if mtime < cutoff:
+                p.unlink()
+        except Exception:
+            pass
+
+
+def retention(snap_dir: Path, quar_root: Path, keep: int, action: str, log) -> None:
+    snaps = sorted([p for p in safe_list_dirs(snap_dir) if p.name.startswith("20")])
+    if len(snaps) <= keep:
+        return
+    old = snaps[: len(snaps) - keep]
+    log.state("RETENTION_SCAN", f"found {len(old)} snapshots older than keep={keep}")
+
+    if action == "keep":
+        log.state("RETENTION", "action=keep (leaving older snapshots)")
+        return
+
+    if action == "quarantine":
+        safe_mkdir(quar_root, parents=True)
+        for d in old:
+            dst = quar_root / d.name
+            log.state("RETENTION", f"quarantine {d.name} -> {dst}")
+            d.rename(dst)
+        return
+
+    if action == "delete":
+        for d in old:
+            log.state("RETENTION", f"delete {d.name}")
+            shutil.rmtree(d)
+        return
+
+    raise RuntimeError(f"unknown retention action: {action}")
+
+
+# ----------------------------
+# SSH helpers (reachability = rsync-ready)
+# ----------------------------
+
+def ssh_cmd_base(ssh_config: Optional[Path]) -> list[str]:
+    base = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=8",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=2",
+    ]
+    if ssh_config and ssh_config.exists():
+        base += ["-F", str(ssh_config)]
+    return base
+
+
+def run_quick(cmd: list[str], *, timeout_s: int = 15) -> tuple[int, str]:
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_s,
+        )
+        return p.returncode, (p.stdout or "")
+    except subprocess.TimeoutExpired as e:
+        out = ""
+        if e.stdout:
+            out = str(e.stdout)
+        return 124, out + ("\n[local] ssh probe timed out\n")
+
+
+def rsync_ready_probe(host: str, ssh_config: Optional[Path], *, timeout_s: int = 15) -> tuple[bool, str]:
+    # “reachable” for your backup purposes means:
+    #   - ssh works AND remote has rsync available
+    cmd = ssh_cmd_base(ssh_config) + [host, "command -v rsync >/dev/null 2>&1 && echo RSYNC_OK"]
+    rc, out = run_quick(cmd, timeout_s=timeout_s)
+    ok = (rc == 0) and ("RSYNC_OK" in out)
+    return ok, out
+
+
+# ----------------------------
+# Resumable run tag
+# ----------------------------
+
+def load_or_create_run_tag(inprog: Path) -> tuple[str, bool, bool]:
+    """
+    Returns (tag, resumed, created_now)
+    created_now=True means we created .run-tag in this invocation.
+    """
+    tag_file = inprog / ".run-tag"
+    if tag_file.exists():
+        tag = tag_file.read_text(encoding="utf-8").strip()
+        if tag:
+            return tag, True, False
+
+    tag = utc_tag()
+    safe_mkdir(inprog, parents=True)
+    tag_file.write_text(tag + "\n", encoding="utf-8")
+    return tag, False, True
+
+
+def clear_run_tag_in_tree(tree: Path) -> None:
+    try:
+        (tree / ".run-tag").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def cleanup_new_empty_inprogress(inprog: Path) -> None:
+    """
+    Best-effort cleanup if we created an in-progress dir/tag this run but did not transfer anything.
+    Only removes if it looks empty-ish (i.e., no real payload).
+    """
+    try:
+        tagf = inprog / ".run-tag"
+        # If there are any entries besides .run-tag and .rsync-partial, leave it alone.
+        entries = [p.name for p in inprog.iterdir()]
+        allowed = {".run-tag", ".rsync-partial"}
+        if all(n in allowed for n in entries):
+            try:
+                tagf.unlink(missing_ok=True)
+            except Exception:
+                pass
+            # remove .rsync-partial if empty
+            rp = inprog / ".rsync-partial"
+            if rp.exists():
+                shutil.rmtree(rp, ignore_errors=True)
+            inprog.rmdir()
+    except Exception:
+        pass
+
+
+# ----------------------------
+# Dual logger
+# ----------------------------
+
+class DualLogger:
+    def __init__(self, *, job: str, log_fp):
+        self.job = job
+        self.fp = log_fp
+
+    def _emit(self, line: str) -> None:
+        if not line.endswith("\n"):
+            line += "\n"
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        self.fp.write(line)
+        self.fp.flush()
+
+    def state(self, state: str, msg: str) -> None:
+        ts = utc_now().strftime("%F %T")
+        self._emit(f"[{ts} UTC] [{self.job}] {state}: {msg}")
+
+    def raw(self, text: str) -> None:
+        if text == "":
+            return
+        if not text.endswith("\n"):
+            text += "\n"
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        self.fp.write(text)
+        self.fp.flush()
+
+
+# ----------------------------
+# Signal-safe runner (process group)
+# ----------------------------
+
+class _Runner:
+    def __init__(self) -> None:
+        self.child_pgid: Optional[int] = None
+        self.signal_seen: Optional[int] = None
+
+
+RUNNER = _Runner()
+
+
+def _forward_signal(sig: int, _frame) -> None:
+    RUNNER.signal_seen = sig
+    if RUNNER.child_pgid is not None:
+        try:
+            os.killpg(RUNNER.child_pgid, sig)
+        except ProcessLookupError:
+            pass
+
+
+def _kill_pgrp(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def run_and_tee(
+    cmd: list[str],
+    log: DualLogger,
+    *,
+    kill_grace_s: int = 20,
+    wallclock_timeout_s: int = 0,
+) -> tuple[int, Optional[int], str]:
+    import selectors
+
+    old_int = signal.getsignal(signal.SIGINT)
+    old_term = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _forward_signal)
+    signal.signal(signal.SIGTERM, _forward_signal)
+
+    start = time.time()
+    reason = "unknown"
+    rc = 1
+    sig_seen: Optional[int] = None
+
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        assert p.stdout is not None
+        RUNNER.child_pgid = os.getpgid(p.pid)
+        RUNNER.signal_seen = None
+
+        sel = selectors.DefaultSelector()
+        sel.register(p.stdout, selectors.EVENT_READ)
+
+        while True:
+            if p.poll() is not None:
+                try:
+                    rest = p.stdout.read()
+                    if rest:
+                        log.raw(rest)
+                except Exception:
+                    pass
+                break
+
+            if wallclock_timeout_s > 0 and (time.time() - start) > wallclock_timeout_s:
+                reason = "wallclock_timeout"
+                log.state("RUN_TIMEOUT", f"wallclock timeout exceeded ({wallclock_timeout_s}s); terminating rsync")
+                _kill_pgrp(RUNNER.child_pgid, signal.SIGTERM)
+                t0 = time.time()
+                while time.time() - t0 < kill_grace_s:
+                    if p.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                if p.poll() is None:
+                    log.state("RUN_TIMEOUT", "rsync did not exit after SIGTERM; sending SIGKILL")
+                    _kill_pgrp(RUNNER.child_pgid, signal.SIGKILL)
+                break
+
+            events = sel.select(timeout=0.5)
+            if not events:
+                continue
+
+            for key, _mask in events:
+                try:
+                    chunk = key.fileobj.readline()
+                except Exception:
+                    chunk = ""
+                if chunk:
+                    chunk = chunk.replace("\r", "\n")
+                    log.raw(chunk)
+
+        rc = p.wait()
+        sig_seen = RUNNER.signal_seen
+        if sig_seen is not None:
+            reason = f"signal_{sig_seen}"
+        elif reason == "wallclock_timeout":
+            if rc == 0:
+                rc = 124
+        else:
+            reason = "exit"
+
+        return rc, sig_seen, reason
+
+    finally:
+        if RUNNER.child_pgid is not None:
+            try:
+                os.killpg(RUNNER.child_pgid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                _kill_pgrp(RUNNER.child_pgid, signal.SIGTERM)
+                t0 = time.time()
+                while time.time() - t0 < kill_grace_s:
+                    try:
+                        os.killpg(RUNNER.child_pgid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.2)
+                else:
+                    _kill_pgrp(RUNNER.child_pgid, signal.SIGKILL)
+
+        RUNNER.child_pgid = None
+        RUNNER.signal_seen = None
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+
+
+# ----------------------------
+# Load-shedding
+# ----------------------------
+
+def wait_for_load(max_load: float, log: DualLogger, poll_s: int = 10) -> None:
+    if max_load <= 0:
+        return
+    warned = False
+    while True:
+        try:
+            one, _five, _fifteen = os.getloadavg()
+        except OSError:
+            return
+        if one <= max_load:
+            return
+        if not warned:
+            log.state("LOAD_WAIT", f"loadavg(1m)={one:.2f} > max_load={max_load:.2f}; waiting")
+            warned = True
+        time.sleep(max(1, poll_s))
+
+
+# ----------------------------
+# Jobs config
+# ----------------------------
+
+@dataclass(frozen=True)
+class Job:
+    device: str
+    ssh: str
+    path: str
+    when: str
+    description: str
+    klass: str
+    keep: int
+    action: str
+
+
+def parse_jobs(cfg: dict[str, Any], defaults: dict[str, Any]) -> list[Job]:
+    jobs_raw = cfg.get("job", [])
+    if not isinstance(jobs_raw, list):
+        raise RuntimeError("jobs.toml must contain one or more [[job]] tables")
+    out: list[Job] = []
+    for j in jobs_raw:
+        if not isinstance(j, dict):
+            continue
+        device = str(j.get("device", "")).strip()
+        if not device:
+            continue
+        sshv = str(j.get("ssh", device)).strip()
+        path = str(j.get("path", f"/home/{device}/")).strip()
+        if not path.endswith("/"):
+            path += "/"
+        when = str(j.get("when", "daily")).strip()
+        desc = str(j.get("description", "")).strip()
+        klass = str(j.get("class", defaults["class"])).strip()
+        keep = int(j.get("keep", defaults["keep"]))
+        if keep < 1:
+            keep = 1
+        action = str(j.get("action", defaults["action"])).strip()
+        out.append(Job(device, sshv, path, when, desc, klass, keep, action))
+    return out
+
+
+# ----------------------------
+# Job outcome + summary
+# ----------------------------
+
+class Outcome(Enum):
+    SUCCESS = "success"
+    SOFT_SUCCESS = "soft_success"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    DEFERRED = "deferred"
+
+
+@dataclass
+class JobSummary:
+    job: Job
+    outcome: Outcome
+    reason: str
+    tag: Optional[str]
+    started: Optional[dt.datetime]
+    ended: Optional[dt.datetime]
+    attempts: int
+
+
+def _fmt_dur(s: JobSummary) -> str:
+    if not s.started or not s.ended:
+        return "-"
+    sec = (s.ended - s.started).total_seconds()
+    if sec < 0:
+        return "-"
+    if sec < 60:
+        return f"{int(sec)}s"
+    if sec < 3600:
+        return f"{int(sec//60)}m{int(sec%60)}s"
+    return f"{int(sec//3600)}h{int((sec%3600)//60)}m"
+
+
+# ----------------------------
+# Main per-job runner
+# ----------------------------
+
+def run_one_job(
+    job: Job,
+    *,
+    backups_root: Path,
+    state_dir: Path,
+    ssh_config: Optional[Path],
+    args,
+) -> JobSummary:
+    started = utc_now()
+
+    dev_dir = backups_root / job.klass / job.device
+    snap_dir = dev_dir / "snapshots"
+    log_dir = dev_dir / "logs"
+    inprog = snap_dir / f".inprogress-{job.device}"
+    quar_root = backups_root / "quarantined" / job.klass / job.device
+
+    for p in (dev_dir, snap_dir, log_dir, inprog, quar_root):
+        ensure_under(backups_root, p)
+
+    safe_mkdir(log_dir, parents=True)
+    safe_mkdir(snap_dir, parents=True)
+
+    tag, resumed, created_now = load_or_create_run_tag(inprog)
+    log_file = log_dir / f"backup-{job.device}-{tag}.log"
+    attempts = 0
+
+    with open(log_file, "a" if log_file.exists() else "w", encoding="utf-8") as log_fp:
+        log = DualLogger(job=job.device, log_fp=log_fp)
+        src = f"{job.ssh}:{job.path}"
+
+        log.state("JOB_START", f"{'resume' if resumed else 'start'} tag={tag} class={job.klass} src={src}")
+        if job.description:
+            log.state("JOB_INFO", f"description={job.description}")
+
+        deep = bool(args.deep_verify or has_prior_failure(state_dir, job.device))
+
+        snaps = sorted([p for p in safe_list_dirs(snap_dir) if p.name.startswith("20")])
+        last_snap = snaps[-1] if snaps else None
+
+        rsync_opts = [
+            "-aHAXx",
+            "--numeric-ids",
+            "--partial",
+            "--partial-dir=.rsync-partial",
+            "--info=stats2,name0",
+            "--human-readable",
+        ]
+        if not args.no_compress:
+            rsync_opts.append("--compress")
+        if args.rsync_timeout and args.rsync_timeout > 0:
+            rsync_opts.append(f"--timeout={args.rsync_timeout}")
+        if args.rsync_stop_after_mins and args.rsync_stop_after_mins > 0:
+            rsync_opts.append(f"--stop-after={args.rsync_stop_after_mins}")
+        if args.bwlimit and args.bwlimit > 0:
+            rsync_opts.append(f"--bwlimit={args.bwlimit}")
+
+        if deep:
+            rsync_opts.append("--checksum")
+            log.state("JOB_MODE", "deep-verify enabled (--checksum) due to prior failure or flag")
+        if last_snap:
+            rsync_opts.append(f"--link-dest={last_snap}")
+
+        safe_mkdir(inprog, parents=True)
+
+        ssh_str = "ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+        if ssh_config and ssh_config.exists():
+            ssh_str += f" -F {shlex.quote(str(ssh_config))}"
+
+        cmd = ["rsync"] + rsync_opts + ["-e", ssh_str, src, str(inprog) + "/"]
+
+        soft_success_rcs = set() if args.strict_rsync else {23, 24}
+        transient_rcs = {12, 30, 35, 255}
+
+        soft_succeeded = False
+
+        while attempts < max(1, args.attempts):
+            attempts += 1
+
+            wait_for_load(args.max_load, log, poll_s=max(1, args.load_poll))
+
+            log.state("RUN_PRECHECK", f"attempt={attempts}: probing (ssh+rsync-ready)")
+            ok, out = rsync_ready_probe(job.ssh, ssh_config, timeout_s=args.ssh_probe_timeout)
+            if out.strip():
+                for line in out.splitlines():
+                    log.raw(f"[probe] {line}")
+
+            if not ok:
+                log.state("RUN_DEFER", f"endpoint not rsync-ready; deferring in this pass (attempt={attempts})")
+                mark_failure(state_dir, job.device, "ssh_or_rsync_unreachable")
+                prune_logs(log_dir, args.log_days)
+
+                # Important: if we created the in-progress tag/dir *this run* and never transferred,
+                # clean it up so we don't accumulate empty .inprogress- dirs.
+                if created_now and not resumed:
+                    log.state("CLEANUP", "removing newly-created empty in-progress dir (deferred before transfer)")
+                    cleanup_new_empty_inprogress(inprog)
+                ended = utc_now()
+                return JobSummary(job, Outcome.DEFERRED, "ssh_or_rsync_unreachable", tag, started, ended, attempts)
+
+            log.state("RUN_START", f"attempt={attempts}: running rsync (cmd below)")
+            log.raw("[cmd] " + " ".join(shlex.quote(c) for c in cmd))
+
+            wall_s = int(args.wallclock_timeout_s) if args.wallclock_timeout_s else 0
+            rc, sig_seen, why = run_and_tee(cmd, log, kill_grace_s=args.kill_grace_s, wallclock_timeout_s=wall_s)
+
+            if sig_seen is not None or rc == 20:
+                log.state("RUN_INTERRUPTED", f"signal={sig_seen} rc={rc}; leaving partials for resume in {inprog}")
+                mark_failure(state_dir, job.device, "interrupted")
+                prune_logs(log_dir, args.log_days)
+                ended = utc_now()
+                return JobSummary(job, Outcome.FAILED, "interrupted", tag, started, ended, attempts)
+
+            if rc == 0:
+                log.state("RUN_OK", f"rsync rc=0 ({why})")
+                break
+
+            if rc in soft_success_rcs:
+                soft_succeeded = True
+                log.state("RUN_SOFT", f"rsync rc={rc} treated as SOFT_SUCCESS; snapshot will be finalized (may be incomplete)")
+                mark_failure(state_dir, job.device, f"soft_rsync_rc_{rc}")
+                break
+
+            if rc in transient_rcs:
+                log.state("RUN_RETRY", f"transient rsync rc={rc}; retrying ({attempts}/{args.attempts})")
+                mark_failure(state_dir, job.device, f"transient_rsync_rc_{rc}")
+                if args.retry_sleep > 0:
+                    time.sleep(args.retry_sleep)
+                continue
+
+            log.state("RUN_FAIL", f"non-transient rsync rc={rc}; leaving partials in {inprog}")
+            mark_failure(state_dir, job.device, f"rsync_rc_{rc}")
+            prune_logs(log_dir, args.log_days)
+            ended = utc_now()
+            return JobSummary(job, Outcome.FAILED, f"rsync_rc_{rc}", tag, started, ended, attempts)
+
+        # Finalize snapshot (on success or soft-success)
+        final = snap_dir / tag
+        if final.exists():
+            shutil.rmtree(final)
+
+        log.state("FINALIZE", f"renaming in-progress -> final: {inprog} -> {final}")
+        inprog.rename(final)
+        clear_run_tag_in_tree(final)
+
+        cur = snap_dir / "current"
+        try:
+            if cur.is_symlink() or cur.exists():
+                cur.unlink()
+        except FileNotFoundError:
+            pass
+        cur.symlink_to(final)
+        log.state("FINALIZE", f"updated current -> {final}")
+
+        if job.action == "delete" and not args.auto:
+            log.state("RETENTION", "action=delete but --auto not set; skipping deletion")
+        else:
+            retention(snap_dir, quar_root, job.keep, job.action, log)
+
+        prune_logs(log_dir, args.log_days)
+
+        outcome = Outcome.SOFT_SUCCESS if soft_succeeded else Outcome.SUCCESS
+        reason = "soft_success" if soft_succeeded else "success"
+        if not soft_succeeded:
+            clear_failure(state_dir, job.device)
+
+        log.state("JOB_DONE", f"outcome={outcome.value} attempts={attempts}")
+        ended = utc_now()
+        return JobSummary(job, outcome, reason, tag, started, ended, attempts)
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Pull backups over SSH (WireGuard), snapshot+retention.")
+    ap.add_argument("--daemon", action="store_true", help="run scheduled jobs from jobs.toml")
+    ap.add_argument("--jobs-file", default="/etc/pull-backup/jobs.toml")
+    ap.add_argument("--backups-root", default="/srv/storage/backups")
+    ap.add_argument("--state-dir", default="/var/lib/pull-backup/state")
+    ap.add_argument("--class", dest="klass", default="laptops")
+    ap.add_argument("--keep", type=int, default=3)
+    ap.add_argument("--action", choices=["quarantine", "delete", "keep"], default="quarantine")
+    ap.add_argument("--log-days", type=int, default=30)
+    ap.add_argument("--auto", action="store_true", help="allow destructive actions like retention delete")
+    ap.add_argument("--deep-verify", action="store_true", help="force rsync --checksum")
+    ap.add_argument("--ssh-config", default="/root/.ssh/config")
+    ap.add_argument("--lock-file", default="/run/pull-backup/lock")
+
+    ap.add_argument("--attempts", type=int, default=2)
+    ap.add_argument("--retry-sleep", type=int, default=10)
+    ap.add_argument("--passes", type=int, default=2)
+    ap.add_argument("--pass-delay", type=int, default=120)
+
+    ap.add_argument("--ssh-probe-timeout", type=int, default=12)
+
+    ap.add_argument("--rsync-timeout", type=int, default=120)
+    ap.add_argument("--rsync-stop-after-mins", type=int, default=0)
+    ap.add_argument("--bwlimit", type=int, default=0)
+    ap.add_argument("--no-compress", action="store_true")
+    ap.add_argument("--strict-rsync", action="store_true")
+
+    ap.add_argument("--wallclock-timeout-s", type=int, default=0)
+    ap.add_argument("--kill-grace-s", type=int, default=20)
+
+    ap.add_argument("--max-load", type=float, default=4.0)
+    ap.add_argument("--load-poll", type=int, default=10)
+
+    ap.add_argument("--exit-soft-nonzero", action="store_true")
+
+    args = ap.parse_args()
+    os.umask(0o077)
+
+    backups_root = Path(args.backups_root).resolve()
+    if str(backups_root) != "/srv/storage/backups":
+        raise RuntimeError("backups-root must be exactly /srv/storage/backups")
+    if not args.daemon:
+        raise RuntimeError("Use --daemon (this tool is scheduler-driven).")
+
+    lock_path = Path(args.lock_file)
+    safe_mkdir(lock_path.parent, parents=True)
+
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX)
+
+        assert_backups_root_ready(backups_root)
+
+        state_dir = Path(args.state_dir)
+        cfg_path = Path(args.jobs_file)
+        defaults = {"class": args.klass, "keep": args.keep, "action": args.action}
+
+        cfg = load_toml(cfg_path)
+        jobs_all = parse_jobs(cfg, defaults)
+
+        jobs: list[Job] = []
+        for j in jobs_all:
+            if when_matches_today(j.when):
+                jobs.append(j)
+            else:
+                ts = utc_now().strftime("%F %T")
+                print(f"[{ts} UTC] [daemon] skip {j.device} (when={j.when})")
+
+        if not jobs:
+            ts = utc_now().strftime("%F %T")
+            print(f"[{ts} UTC] [daemon] no jobs to run today")
+            return 0
+
+        ssh_config = Path(args.ssh_config) if args.ssh_config else None
+
+        ts = utc_now().strftime("%F %T")
+        print(f"[{ts} UTC] [run] PREFLIGHT: probing {len(jobs)} endpoints (ssh+rsync-ready)")
+        reachable: list[Job] = []
+        unreachable: list[tuple[Job, str]] = []
+        for j in jobs:
+            ok, out = rsync_ready_probe(j.ssh, ssh_config, timeout_s=args.ssh_probe_timeout)
+            if ok:
+                reachable.append(j)
+            else:
+                reason = "not_rsync_ready"
+                if out.strip():
+                    reason = "not_rsync_ready_with_output"
+                unreachable.append((j, reason))
+
+        ts = utc_now().strftime("%F %T")
+        print(f"[{ts} UTC] [run] PREFLIGHT: reachable={len(reachable)} unreachable={len(unreachable)}")
+        for j, r in unreachable:
+            print(f"[{ts} UTC] [run] PREFLIGHT_DEFER: {j.device} ({j.ssh}) reason={r}")
+
+        summaries: list[JobSummary] = []
+        deferred: list[Job] = [j for (j, _r) in unreachable]
+
+        passes = max(1, int(args.passes))
+        for pidx in range(passes):
+            pass_no = pidx + 1
+            ts = utc_now().strftime("%F %T")
+            print(f"[{ts} UTC] [run] PASS_START: {pass_no}/{passes}")
+
+            run_list = reachable if pass_no == 1 else deferred
+
+            if not run_list:
+                print(f"[{ts} UTC] [run] PASS_EMPTY: nothing to run in pass {pass_no}")
+            else:
+                next_deferred: list[Job] = []
+                for job in run_list:
+                    s = run_one_job(
+                        job,
+                        backups_root=backups_root,
+                        state_dir=state_dir,
+                        ssh_config=ssh_config,
+                        args=args,
+                    )
+                    summaries.append(s)
+                    if s.outcome == Outcome.DEFERRED and pass_no < passes:
+                        next_deferred.append(job)
+                deferred = next_deferred
+
+            ts = utc_now().strftime("%F %T")
+            print(f"[{ts} UTC] [run] PASS_END: {pass_no}/{passes} deferred_for_next_pass={len(deferred)}")
+
+            if pass_no < passes and args.pass_delay > 0 and deferred:
+                print(f"[{ts} UTC] [run] PASS_SLEEP: sleeping {args.pass_delay}s before next pass")
+                time.sleep(args.pass_delay)
+
+        hard_fail = any(s.outcome == Outcome.FAILED for s in summaries)
+        soft = any(s.outcome == Outcome.SOFT_SUCCESS for s in summaries)
+        deferred_left = len(deferred)
+
+        ts = utc_now().strftime("%F %T")
+        print(f"[{ts} UTC] [summary] ------------------------------")
+        for outc in (Outcome.SUCCESS, Outcome.SOFT_SUCCESS, Outcome.FAILED, Outcome.DEFERRED, Outcome.SKIPPED):
+            grp = [s for s in summaries if s.outcome == outc]
+            if not grp:
+                continue
+            print(f"[{ts} UTC] [summary] {outc.value}: {len(grp)}")
+            for s in grp:
+                tag_part = f" tag={s.tag}" if s.tag else ""
+                print(
+                    f"[{ts} UTC] [summary]  - {s.job.device}: reason={s.reason}{tag_part} "
+                    f"attempts={s.attempts} dur={_fmt_dur(s)}"
+                )
+
+        if deferred_left > 0:
+            print(f"[{ts} UTC] [summary] deferred_unfinished: {deferred_left}")
+            for j in deferred:
+                print(f"[{ts} UTC] [summary]  - {j.device}: still deferred after all passes")
+
+        print(f"[{ts} UTC] [summary] ------------------------------")
+
+        if hard_fail:
+            return 1
+        if soft and args.exit_soft_nonzero:
+            return 2
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RuntimeError as e:
+        print(f"[fatal] {e}", file=sys.stderr)
+        msg = str(e).lower()
+        if "backup filesystem not available" in msg or "stale mount" in msg:
+            raise SystemExit(3)
+        raise SystemExit(4)
+    except Exception as e:
+        print(f"[fatal] {e}", file=sys.stderr)
+        raise SystemExit(1)
+

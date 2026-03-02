@@ -1,0 +1,111 @@
+import sys
+from functools import lru_cache
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+import datetime as dt
+
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "pull-backup"
+
+
+@lru_cache(maxsize=1)
+def load_module():
+    """
+    Load the extensionless executable 'pull-backup' as a Python module.
+
+    Python 3.13: spec_from_file_location() may return None for extensionless paths,
+    so we force a SourceFileLoader.
+    """
+    assert SCRIPT_PATH.exists(), f"missing script at {SCRIPT_PATH}"
+    assert SCRIPT_PATH.is_file(), f"not a file: {SCRIPT_PATH}"
+
+    name = "pull_backup"
+
+    loader = SourceFileLoader(name, str(SCRIPT_PATH))
+    spec = spec_from_loader(name, loader, origin=str(SCRIPT_PATH))
+    assert spec and spec.loader, "failed to build import spec via SourceFileLoader"
+
+    mod = module_from_spec(spec)
+
+    # CRITICAL: dataclasses + postponed/string annotations require the module to be in sys.modules
+    sys.modules[name] = mod
+    try:
+        loader.exec_module(mod)
+    except Exception:
+        # don't leave a half-imported module lying around
+        sys.modules.pop(name, None)
+        raise
+
+    return mod
+
+
+def test_when_matches_today_daily_and_star():
+    m = load_module()
+    assert m.when_matches_today("daily") is True
+    assert m.when_matches_today("*") is True
+    assert m.when_matches_today("") is True
+
+
+def test_when_matches_today_accepts_today_name_or_iso():
+    m = load_module()
+    iso, name = m.iso_wd_and_name_local()
+    assert m.when_matches_today(iso) is True
+    assert m.when_matches_today(name) is True
+    assert m.when_matches_today(f"{iso},Wed,Thu") is True
+
+
+def test_adaptive_du_timeout_monotonicish_and_capped():
+    m = load_module()
+    base = 10
+    assert m.adaptive_du_timeout(base, None) == base
+    t1 = m.adaptive_du_timeout(base, 1 * 1024**3)
+    assert t1 >= base
+    t2 = m.adaptive_du_timeout(base, 256 * 1024**3)
+    assert t2 >= t1
+    assert t2 <= max(base, min(180, base * 6))
+
+
+def test_resumable_detection(tmp_path):
+    m = load_module()
+    snap_dir = tmp_path / "snapshots"
+    snap_dir.mkdir()
+    inprog = snap_dir / ".inprogress-klein"
+    inprog.mkdir()
+
+    has_r, tag = m.has_resumable_inprogress(snap_dir, "klein")
+    assert has_r is False
+    assert tag is None
+
+    (inprog / ".run-tag").write_text("20260113-000000Z\n", encoding="utf-8")
+    has_r, tag = m.has_resumable_inprogress(snap_dir, "klein")
+    assert has_r is True
+    assert tag == "20260113-000000Z"
+
+
+def test_collapse_summaries_by_device_does_not_double_count():
+    m = load_module()
+    Job = m.Job
+    JobSummary = m.JobSummary
+    Outcome = m.Outcome
+
+    j = Job(
+        device="klein",
+        ssh="klein",
+        path="/home/klein/",
+        when="daily",
+        description="",
+        klass="laptops",
+        keep=3,
+        action="quarantine",
+    )
+
+    now = dt.datetime.now(dt.timezone.utc)
+    s1 = JobSummary(j, Outcome.DEFERRED, "ssh_or_rsync_unreachable", "tag1", now, now, 1)
+    s2 = JobSummary(j, Outcome.DEFERRED, "ssh_or_rsync_unreachable", "tag1", now, now, 1)
+
+    collapsed = m.collapse_summaries_by_device([s1, s2])
+    assert len(collapsed) == 1
+    assert collapsed[0].job.device == "klein"
+    assert collapsed[0].outcome == Outcome.DEFERRED
+    assert collapsed[0].attempts == 2
+
